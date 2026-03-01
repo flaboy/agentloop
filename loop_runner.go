@@ -946,11 +946,8 @@ func summarizeCreateResponseRequest(req CreateResponseRequest) string {
 }
 
 func resolveResponsesStoreFromContext(ctx context.Context) bool {
-	scope, ok := TaskScopeFromContext(ctx)
-	if !ok {
-		return false
-	}
-	return scope.ResponsesStore
+	storeEnabled, _ := ResponsesStoreFromContext(ctx)
+	return storeEnabled
 }
 
 func boolPtr(v bool) *bool {
