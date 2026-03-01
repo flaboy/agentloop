@@ -8,3 +8,5 @@ Shared generic agent loop library.
 - Loop events are published to an internal event bus accessible via `runner.EventBus()`.
 - Context input supports structured request via `RunWithContext`/`RunStreamWithContext`.
 - Runner emits explicit state transitions (`RunnerState`/`RunnerEvent`/`TransitionRecord`) through `TransitionEvent`, and `LastTransitions()` returns the latest run records.
+- Transition recording is enforced by `RunnerTransitionGuard` (strict state/event/to validation, no fallback path).
+- Tool execution uses a typed pipeline (`ToolPipeline`) for allowlist check + registry execution + normalized `ToolError`.

@@ -138,7 +138,11 @@ func (r *LoopRunner) runWithContextRequest(
 
 	transitionRecords := make([]TransitionRecord, 0, 16)
 	state := RunnerStateIdle
+	guard := NewRunnerTransitionGuard()
 	transition := func(event RunnerEvent, to RunnerState, iteration int, snapshot RunnerSnapshot) {
+		if err := guard.Validate(state, event, to); err != nil {
+			panic(err)
+		}
 		record := TransitionRecord{
 			From:      state,
 			Event:     event,
@@ -463,22 +467,14 @@ func (r *LoopRunner) executeToolCall(
 	allowlistConfigured bool,
 	call core.ToolCall,
 ) (string, string, bool) {
-	if r.tools == nil {
-		err := NewToolError("TOOL_REGISTRY_UNAVAILABLE", "Ensure tool registry is initialized and injected into LoopRunner")
-		return mustMarshalToolError(err), err.ErrorString, true
-	}
-	if allowlistConfigured {
-		if _, ok := allowedTools[strings.TrimSpace(call.Name)]; !ok {
-			err := NewToolError(
-				"TOOL_NOT_ENABLED_IN_MODE",
-				fmt.Sprintf("Tool %q is not in current allowed_tools; switch mode or adjust allowlist, then retry", strings.TrimSpace(call.Name)),
-			)
-			return mustMarshalToolError(err), err.ErrorString, true
-		}
-	}
-	toolOut, err := r.tools.Execute(ctx, struct{}{}, call.Name, call.Arguments, call.CallID)
-	if err != nil {
-		return mustMarshalToolError(err), err.ErrorString, true
+	pipeline := NewToolPipeline(r.tools)
+	toolOut, toolErr := pipeline.Execute(ctx, ToolPipelineInput{
+		AllowedTools:        allowedTools,
+		AllowlistConfigured: allowlistConfigured,
+		ToolCall:            call,
+	})
+	if toolErr != nil {
+		return mustMarshalToolError(toolErr), toolErr.ErrorString, true
 	}
 	return toolOut, "", false
 }

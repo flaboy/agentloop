@@ -42,6 +42,13 @@ func TestLoopRunner_RecordsTransitions(t *testing.T) {
 	if last.Event != RunnerEventRunCompleted || last.To != RunnerStateCompleted {
 		t.Fatalf("unexpected last transition: %#v", last)
 	}
+
+	guard := NewRunnerTransitionGuard()
+	for _, record := range records {
+		if err := guard.Validate(record.From, record.Event, record.To); err != nil {
+			t.Fatalf("invalid transition record: %+v err=%v", record, err)
+		}
+	}
 }
 
 func TestLoopRunner_EmitsContextRewriteEvent(t *testing.T) {
