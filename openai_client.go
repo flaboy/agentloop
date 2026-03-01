@@ -57,7 +57,6 @@ func (c *ResponsesClient) CreateResponse(ctx context.Context, req core.CreateRes
 	if err != nil {
 		return nil, err
 	}
-	emitResponsesRequestRaw(ctx, marshalJSONForDebug(params))
 	var rawResp *http.Response
 	var rawBody []byte
 	requestOpts := []option.RequestOption{
@@ -74,7 +73,6 @@ func (c *ResponsesClient) CreateResponse(ctx context.Context, req core.CreateRes
 	if len(rawBody) == 0 {
 		return nil, fmt.Errorf("responses api returned empty response request=%s", summarizeCreateResponseRequest(req))
 	}
-	emitResponsesResponseRaw(ctx, string(rawBody))
 	return parseResponseResult(rawBody)
 }
 
@@ -90,7 +88,6 @@ func (c *ResponsesClient) CreateResponseStream(ctx context.Context, req core.Cre
 	if err != nil {
 		return nil, err
 	}
-	emitResponsesRequestRaw(ctx, marshalJSONForDebug(params))
 	var rawResp *http.Response
 	requestOpts := []option.RequestOption{option.WithResponseInto(&rawResp)}
 	if c.cfg.EnableState {
@@ -253,7 +250,6 @@ func (c *ResponsesClient) CreateResponseStream(ctx context.Context, req core.Cre
 		if data == "" {
 			return nil
 		}
-		emitResponsesStreamEventRaw(ctx, data)
 		var event struct {
 			Type       string          `json:"type"`
 			Delta      string          `json:"delta"`
@@ -603,14 +599,6 @@ func appendEventTrace(trace []string, entry string) []string {
 		trace = trace[1:]
 	}
 	return append(trace, entry)
-}
-
-func marshalJSONForDebug(v responses.ResponseNewParams) string {
-	raw, err := json.Marshal(v)
-	if err != nil {
-		return fmt.Sprintf("{\"marshal_error\":%q}", err.Error())
-	}
-	return string(raw)
 }
 
 func summarizeStreamEventForTrace(

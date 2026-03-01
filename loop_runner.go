@@ -90,10 +90,8 @@ func (r *LoopRunner) run(
 		return "", errors.New("context builder is required")
 	}
 
-	storeEnabled := resolveResponsesStoreFromContext(ctx)
 	contextResult, buildErr := r.contextBuilder.Build(ContextBuildRequest{
-		UserPrompt:   userPrompt,
-		StoreEnabled: storeEnabled,
+		UserPrompt: userPrompt,
 	})
 	if buildErr != nil {
 		return "", fmt.Errorf("build initial context failed: %w", buildErr)
@@ -279,7 +277,6 @@ func (r *LoopRunner) run(
 		err = r.runHookChain(HookPointRoundtrip, roundHookCtx, func() error {
 			historyInputItems = append(historyInputItems, replayItems...)
 			req = core.CreateResponseRequest{
-				Store: boolPtr(storeEnabled),
 				Input: core.NewResponseInputItems(cloneResponseInputItems(historyInputItems)),
 			}
 			roundHookCtx.Request = &req
@@ -509,15 +506,6 @@ func summarizeCreateResponseRequest(req core.CreateResponseRequest) string {
 		fmt.Sprintf("input=%s", summarizeResponseInput(req.Input)),
 	}
 	return strings.Join(parts, " ")
-}
-
-func resolveResponsesStoreFromContext(ctx context.Context) bool {
-	storeEnabled, _ := ResponsesStoreFromContext(ctx)
-	return storeEnabled
-}
-
-func boolPtr(v bool) *bool {
-	return &v
 }
 
 func roundtripModeName(fullContext bool) string {

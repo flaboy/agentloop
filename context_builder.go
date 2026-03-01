@@ -8,8 +8,7 @@ import (
 )
 
 type ContextBuildRequest struct {
-	UserPrompt   string
-	StoreEnabled bool
+	UserPrompt string
 }
 
 type ContextBuildResult struct {
@@ -39,7 +38,6 @@ func (b DefaultContextBuilder) Build(req ContextBuildRequest) (ContextBuildResul
 	historyInputItems = append(historyInputItems, buildUserMessageInputItem(userPromptForUserMessage))
 
 	request := core.CreateResponseRequest{
-		Store: boolPtr(req.StoreEnabled),
 		Input: core.NewResponseInputItems(cloneResponseInputItems(historyInputItems)),
 	}
 	return ContextBuildResult{
