@@ -13,10 +13,8 @@ type ContextBuildRequest struct {
 }
 
 type ContextBuildResult struct {
-	Request                        core.CreateResponseRequest
-	HistoryInputItems              []core.ResponseInputItem
-	InitialPromptCurrentCommand    string
-	HasInitialPromptCurrentCommand bool
+	Request           core.CreateResponseRequest
+	HistoryInputItems []core.ResponseInputItem
 }
 
 type ContextBuilder interface {
@@ -40,15 +38,12 @@ func (b DefaultContextBuilder) Build(req ContextBuildRequest) (ContextBuildResul
 	}
 	historyInputItems = append(historyInputItems, buildUserMessageInputItem(userPromptForUserMessage))
 
-	initialPromptCurrentCommand, hasInitialPromptCurrentCommand := extractPromptCurrentCommand(userPrompt)
 	request := core.CreateResponseRequest{
 		Store: boolPtr(req.StoreEnabled),
 		Input: core.NewResponseInputItems(cloneResponseInputItems(historyInputItems)),
 	}
 	return ContextBuildResult{
-		Request:                        request,
-		HistoryInputItems:              historyInputItems,
-		InitialPromptCurrentCommand:    initialPromptCurrentCommand,
-		HasInitialPromptCurrentCommand: hasInitialPromptCurrentCommand,
+		Request:           request,
+		HistoryInputItems: historyInputItems,
 	}, nil
 }
