@@ -2,7 +2,6 @@ package core
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
@@ -101,7 +100,7 @@ func (r *ToolRegistry[S]) SpecsByNames(names []string) []ResponseToolSpec {
 	return out
 }
 
-func (r *ToolRegistry[S]) Execute(ctx context.Context, state S, name string, input json.RawMessage, callID string) (string, *ToolError) {
+func (r *ToolRegistry[S]) Execute(ctx context.Context, state S, name string, input string, callID string) (string, *ToolError) {
 	tool, ok := r.Get(name)
 	if !ok {
 		return "", NewToolError("TOOL_NOT_FOUND", "tool is not registered")

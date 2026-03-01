@@ -5,33 +5,49 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
+	"time"
+
+	core "github.com/flaboy/agentloop/core"
 )
 
 type ResponsesAPI interface {
-	CreateResponse(ctx context.Context, req CreateResponseRequest) (*CreateResponseResult, error)
+	CreateResponse(ctx context.Context, req core.CreateResponseRequest) (*core.CreateResponseResult, error)
 }
 
 type ResponsesStreamAPI interface {
-	CreateResponseStream(ctx context.Context, req CreateResponseRequest, onTextDelta func(string)) (*CreateResponseResult, error)
+	CreateResponseStream(ctx context.Context, req core.CreateResponseRequest, onTextDelta func(string)) (*core.CreateResponseResult, error)
 }
 
 type LoopRunnerOptions struct {
-	MaxIterations int
+	MaxIterations  int
+	ContextBuilder ContextBuilder
 }
 
 type LoopRunner struct {
-	client  ResponsesAPI
-	tools   *ToolRegistry
-	options LoopRunnerOptions
+	client         ResponsesAPI
+	tools          *core.ToolRegistry[struct{}]
+	options        LoopRunnerOptions
+	contextBuilder ContextBuilder
 }
 
-func NewLoopRunner(client ResponsesAPI, tools *ToolRegistry, options LoopRunnerOptions) *LoopRunner {
+func NewLoopRunner(client ResponsesAPI, tools *core.ToolRegistry[struct{}], options LoopRunnerOptions) *LoopRunner {
 	if options.MaxIterations <= 0 {
 		options.MaxIterations = 8
 	}
-	return &LoopRunner{client: client, tools: tools, options: options}
+	builder := options.ContextBuilder
+	if builder == nil {
+		builder = DefaultContextBuilder{}
+	}
+	return &LoopRunner{
+		client:         client,
+		tools:          tools,
+		options:        options,
+		contextBuilder: builder,
+	}
 }
 
 func (r *LoopRunner) Run(ctx context.Context, userPrompt string) (string, error) {
@@ -46,7 +62,7 @@ func (r *LoopRunner) RunStreamWithTools(
 	ctx context.Context,
 	userPrompt string,
 	onTextDelta func(string),
-	onToolEvent func(map[string]any),
+	onToolEvent func(LoopEvent),
 ) (string, error) {
 	return r.run(ctx, userPrompt, onTextDelta, onToolEvent)
 }
@@ -55,43 +71,28 @@ func (r *LoopRunner) run(
 	ctx context.Context,
 	userPrompt string,
 	onTextDelta func(string),
-	onToolEvent func(map[string]any),
+	onToolEvent func(LoopEvent),
 ) (string, error) {
 	if r == nil || r.client == nil {
 		return "", errors.New("loop runner client is required")
 	}
+	if r.contextBuilder == nil {
+		return "", errors.New("context builder is required")
+	}
+
 	storeEnabled := resolveResponsesStoreFromContext(ctx)
-	// Always use full-context roundtrip mode: re-send the entire conversation
-	// history (user message + function_call items + function_call_output items)
-	// in every request instead of relying on previous_response_id.
-	//
-	// The previous_response_id approach requires the provider to persist the
-	// response server-side. When routed through a proxy (e.g. OpenRouter, Azure)
-	// with store=false — or even store=true with a provider that doesn't honour
-	// it — the referenced response is gone and the API returns:
-	//   "No tool call found for function call output with call_id <id>"
-	//
-	// Full-context mode is slightly larger per request but works with every
-	// provider and avoids the 400 error entirely.
-	fullContextRoundtrip := true
-	userPrompt = strings.TrimSpace(userPrompt)
-	userPromptForUserMessage := userPrompt
-	historyInputItems := make([]map[string]any, 0, 8)
-	if systemContextText, ok := extractPromptSystemContextJSON(userPrompt); ok {
-		historyInputItems = append(historyInputItems, buildSystemMessageInputItem(systemContextText))
-		if stripped, ok := stripPromptSystemContextSection(userPrompt); ok {
-			userPromptForUserMessage = stripped
-		}
+	contextResult, buildErr := r.contextBuilder.Build(ContextBuildRequest{
+		UserPrompt:   userPrompt,
+		StoreEnabled: storeEnabled,
+	})
+	if buildErr != nil {
+		return "", fmt.Errorf("build initial context failed: %w", buildErr)
 	}
-	historyInputItems = append(historyInputItems, buildUserMessageInputItem(userPromptForUserMessage))
-	req := CreateResponseRequest{Store: boolPtr(storeEnabled)}
-	if fullContextRoundtrip {
-		req.Input = cloneResponseInputItems(historyInputItems)
-	} else {
-		req.Input = userPrompt
-	}
+	req := contextResult.Request
+	historyInputItems := cloneResponseInputItems(contextResult.HistoryInputItems)
 	lastResponseTrace := ""
-	initialPromptCurrentCommand, hasInitialPromptCurrentCommand := extractPromptCurrentCommand(userPrompt)
+	initialPromptCurrentCommand := contextResult.InitialPromptCurrentCommand
+	hasInitialPromptCurrentCommand := contextResult.HasInitialPromptCurrentCommand
 	previousRoundMode := ""
 	forceRoundModeHintNextIteration := false
 	stalePromptCurrentCommandDetected := false
@@ -99,10 +100,12 @@ func (r *LoopRunner) run(
 	promptCurrentCommandCleared := false
 
 	for i := 0; i < r.options.MaxIterations; i++ {
+		iteration := i + 1
 		allowedTools, allowlistConfigured := allowedToolNameSetFromContext(ctx)
 		if r.tools != nil {
 			req.Tools = r.resolveToolSpecs(allowedTools, allowlistConfigured)
 		}
+
 		currentRoundMode := resolveRoundModeFromAllowedTools(allowedTools, allowlistConfigured)
 		modeChanged := previousRoundMode != "" && currentRoundMode != "" && currentRoundMode != previousRoundMode
 		if !promptCurrentCommandCleared && hasInitialPromptCurrentCommand && (modeChanged || stalePromptCurrentCommandDetected) {
@@ -113,80 +116,44 @@ func (r *LoopRunner) run(
 			clearReasons = append(clearReasons, sortedReasonKeys(stalePromptCurrentCommandReasons)...)
 			if updatedInput, changed := clearCurrentCommandFromResponseInput(req.Input); changed {
 				req.Input = updatedInput
-				if fullContextRoundtrip {
-					if updatedItems, ok := updatedInput.([]map[string]any); ok {
-						historyInputItems = cloneResponseInputItems(updatedItems)
-					}
-				}
+				historyInputItems = cloneResponseInputItems(updatedInput.Items)
 				promptCurrentCommandCleared = true
 				forceRoundModeHintNextIteration = true
 				stalePromptCurrentCommandDetected = false
 				stalePromptCurrentCommandReasons = map[string]struct{}{}
-				if onToolEvent != nil {
-					onToolEvent(map[string]any{
-						"type":                  "agent-debug",
-						"stage":                 "responses.prompt.current_command.cleared",
-						"iteration":             i + 1,
-						"clear_reasons":         clearReasons,
-						"previous_round_mode":   previousRoundMode,
-						"current_round_mode":    currentRoundMode,
-						"initial_current_cmd":   initialPromptCurrentCommand,
-						"history_items_updated": true,
-					})
-				}
+				emitToolEvent(onToolEvent, ContextRewriteEvent{
+					Iteration:           iteration,
+					Timestamp:           time.Now(),
+					ClearReasons:        clearReasons,
+					PreviousRoundMode:   previousRoundMode,
+					CurrentRoundMode:    currentRoundMode,
+					InitialCurrentCmd:   initialPromptCurrentCommand,
+					HistoryItemsUpdated: true,
+				})
 			}
 		}
+
 		callReq := req
 		injectRoundModeHint := forceRoundModeHintNextIteration || modeChanged
 		callReq.Input = withRoundModeHintInputWhen(req.Input, allowedTools, allowlistConfigured, injectRoundModeHint)
 		forceRoundModeHintNextIteration = false
-		if err := ValidateResponseInputInvariants(callReq.Input); err != nil {
-			base := fmt.Sprintf("responses input invariant failed iteration=%d %s", i+1, summarizeCreateResponseRequest(callReq))
+		if err := core.ValidateResponseInputInvariants(callReq.Input); err != nil {
+			base := fmt.Sprintf("responses input invariant failed iteration=%d %s", iteration, summarizeCreateResponseRequest(callReq))
 			return "", fmt.Errorf("%s: %w", base, err)
 		}
 		reqSummary := summarizeCreateResponseRequest(callReq)
-		if onToolEvent != nil {
-			onToolEvent(map[string]any{
-				"type":              "agent-debug",
-				"stage":             "responses.request",
-				"iteration":         i + 1,
-				"request":           reqSummary,
-				"previous_response": lastResponseTrace,
-				"roundtrip_mode":    roundtripModeName(fullContextRoundtrip),
-			})
-		}
+		emitToolEvent(onToolEvent, ModelRequestEvent{
+			Iteration:        iteration,
+			Timestamp:        time.Now(),
+			Request:          reqSummary,
+			PreviousResponse: lastResponseTrace,
+			RoundtripMode:    roundtripModeName(true),
+		})
+
 		callCtx := ctx
-		if onToolEvent != nil {
-			iteration := i + 1
-			callCtx = WithResponsesDebugHooks(ctx, ResponsesDebugHooks{
-				OnRequestRaw: func(raw string) {
-					onToolEvent(map[string]any{
-						"type":        "agent-debug",
-						"stage":       "responses.request.raw",
-						"iteration":   iteration,
-						"request_raw": raw,
-					})
-				},
-				OnResponseRaw: func(raw string) {
-					onToolEvent(map[string]any{
-						"type":         "agent-debug",
-						"stage":        "responses.response.raw",
-						"iteration":    iteration,
-						"response_raw": raw,
-					})
-				},
-				OnStreamEventRaw: func(raw string) {
-					onToolEvent(map[string]any{
-						"type":      "agent-debug",
-						"stage":     "responses.stream.event.raw",
-						"iteration": iteration,
-						"event_raw": raw,
-					})
-				},
-			})
-		}
+
 		var (
-			res *CreateResponseResult
+			res *core.CreateResponseResult
 			err error
 		)
 		if onTextDelta != nil {
@@ -202,177 +169,81 @@ func (r *LoopRunner) run(
 			res, err = r.client.CreateResponse(callCtx, callReq)
 		}
 		if err != nil {
-			base := fmt.Sprintf("responses request failed iteration=%d %s", i+1, reqSummary)
+			base := fmt.Sprintf("responses request failed iteration=%d %s", iteration, reqSummary)
 			if strings.TrimSpace(lastResponseTrace) != "" {
 				base += " prev_response_trace=" + lastResponseTrace
 			}
 			return "", fmt.Errorf("%s: %w", base, err)
 		}
+
 		currentTrace := summarizeEventTrace(res.EventTrace)
-		if onToolEvent != nil {
-			onToolEvent(map[string]any{
-				"type":               "agent-debug",
-				"stage":              "responses.response",
-				"iteration":          i + 1,
-				"response_id":        strings.TrimSpace(res.ID),
-				"tool_calls":         len(res.ToolCalls),
-				"tool_calls_summary": summarizeToolCalls(res.ToolCalls),
-				"final_text_len":     len(strings.TrimSpace(res.FinalText)),
-				"event_trace":        currentTrace,
-				"event_count":        len(res.EventTrace),
-			})
-		}
+		emitToolEvent(onToolEvent, ModelResponseEvent{
+			Iteration:        iteration,
+			Timestamp:        time.Now(),
+			ResponseID:       strings.TrimSpace(res.ID),
+			ToolCalls:        len(res.ToolCalls),
+			ToolCallsSummary: summarizeToolCalls(res.ToolCalls),
+			FinalTextLen:     len(strings.TrimSpace(res.FinalText)),
+			EventTrace:       currentTrace,
+			EventCount:       len(res.EventTrace),
+		})
 		lastResponseTrace = currentTrace
+
 		if res.HasFinalText() {
 			return res.FinalText, nil
 		}
 		if len(res.ToolCalls) == 0 {
 			return "", fmt.Errorf(
 				"responses api returned no output_text and no tool_calls iteration=%d response_id=%q %s response_trace=%s",
-				i+1,
+				iteration,
 				strings.TrimSpace(res.ID),
 				reqSummary,
 				currentTrace,
 			)
 		}
-		if !fullContextRoundtrip && strings.TrimSpace(res.ID) == "" {
-			return "", fmt.Errorf(
-				"responses stream missing response id for tool roundtrip iteration=%d tool_calls=%s %s response_trace=%s",
-				i+1,
-				summarizeToolCalls(res.ToolCalls),
-				reqSummary,
-				currentTrace,
-			)
-		}
-		outputs := make([]map[string]any, 0, len(res.ToolCalls))
-		fullContextRoundtripItems := make([]map[string]any, 0, len(res.ToolCalls)*2)
+
+		outputs := make([]core.ResponseInputItem, 0, len(res.ToolCalls))
+		replayItems := make([]core.ResponseInputItem, 0, len(res.ToolCalls)*2)
 		for _, call := range res.ToolCalls {
 			callID := strings.TrimSpace(call.CallID)
-			callResponseID := strings.TrimSpace(call.ResponseID)
 			if callID == "" {
 				return "", fmt.Errorf(
 					"responses tool call missing call_id iteration=%d tool=%s id=%s response_id=%q %s",
-					i+1,
+					iteration,
 					strings.TrimSpace(call.Name),
 					strings.TrimSpace(call.ID),
 					strings.TrimSpace(res.ID),
 					reqSummary,
 				)
 			}
-			if !fullContextRoundtrip && callResponseID != "" && callResponseID != strings.TrimSpace(res.ID) {
-				return "", fmt.Errorf(
-					"responses tool call response_id mismatch iteration=%d response_id=%q tool_response_id=%q call_id=%s tool=%s %s",
-					i+1,
-					strings.TrimSpace(res.ID),
-					callResponseID,
-					callID,
-					strings.TrimSpace(call.Name),
-					reqSummary,
-				)
+
+			emitToolEvent(onToolEvent, ToolInputEvent{
+				Iteration:    iteration,
+				Timestamp:    time.Now(),
+				CallID:       callID,
+				ResponseID:   strings.TrimSpace(res.ID),
+				ToolName:     strings.TrimSpace(call.Name),
+				Input:        normalizeJSONText(call.Arguments),
+				InputRawLen:  len(strings.TrimSpace(call.Arguments)),
+				InputPreview: clipForLog(strings.TrimSpace(call.Arguments), 800),
+			})
+
+			out, outputErrText, outputIsError := r.executeToolCall(ctx, allowedTools, allowlistConfigured, call)
+			outputState := "output-available"
+			if outputIsError {
+				outputState = "output-error"
 			}
-			if onToolEvent != nil {
-				onToolEvent(map[string]any{
-					"type":          "dynamic-tool",
-					"call_id":       callID,
-					"response_id":   strings.TrimSpace(res.ID),
-					"tool_name":     strings.TrimSpace(call.Name),
-					"state":         "input-available",
-					"input":         rawJSONToAny(call.Arguments),
-					"input_raw_len": len(strings.TrimSpace(string(call.Arguments))),
-					"input_preview": clipForLog(strings.TrimSpace(string(call.Arguments)), 800),
-				})
-			}
-			var out string
-			if r.tools == nil {
-				toolErr := NewToolError("TOOL_REGISTRY_UNAVAILABLE", "确认工具注册表已初始化并注入到 LoopRunner")
-				out = mustMarshalToolError(toolErr)
-			} else {
-				if allowlistConfigured {
-					if _, ok := allowedTools[strings.TrimSpace(call.Name)]; !ok {
-						toolErr := NewToolError(
-							"TOOL_NOT_ENABLED_IN_MODE",
-							fmt.Sprintf("工具 %q 不在当前 allowed_tools 中；切换模式或调整 allowlist 后重试", strings.TrimSpace(call.Name)),
-						)
-						errOut := mustMarshalToolError(toolErr)
-						if onToolEvent != nil {
-							onToolEvent(map[string]any{
-								"type":        "dynamic-tool",
-								"call_id":     callID,
-								"response_id": strings.TrimSpace(res.ID),
-								"tool_name":   strings.TrimSpace(call.Name),
-								"state":       "output-error",
-								"error_text":  toolErr.ErrorString,
-								"output_len":  len(strings.TrimSpace(errOut)),
-								"output":      stringToMaybeJSONAny(errOut),
-							})
-						}
-						out = errOut
-						forceRoundModeHintNextIteration = true
-					} else {
-						toolOut, err := r.tools.Execute(ctx, call.Name, call.Arguments, call.CallID)
-						if err != nil {
-							errOut := mustMarshalToolError(err)
-							if onToolEvent != nil {
-								onToolEvent(map[string]any{
-									"type":        "dynamic-tool",
-									"call_id":     callID,
-									"response_id": strings.TrimSpace(res.ID),
-									"tool_name":   strings.TrimSpace(call.Name),
-									"state":       "output-error",
-									"error_text":  err.ErrorString,
-									"output_len":  len(strings.TrimSpace(errOut)),
-									"output":      stringToMaybeJSONAny(errOut),
-								})
-							}
-							out = errOut
-						} else {
-							out = toolOut
-							if onToolEvent != nil {
-								onToolEvent(map[string]any{
-									"type":        "dynamic-tool",
-									"call_id":     callID,
-									"response_id": strings.TrimSpace(res.ID),
-									"tool_name":   strings.TrimSpace(call.Name),
-									"state":       "output-available",
-									"output":      stringToMaybeJSONAny(toolOut),
-									"output_len":  len(strings.TrimSpace(toolOut)),
-								})
-							}
-						}
-					}
-				} else {
-					toolOut, err := r.tools.Execute(ctx, call.Name, call.Arguments, call.CallID)
-					if err != nil {
-						errOut := mustMarshalToolError(err)
-						if onToolEvent != nil {
-							onToolEvent(map[string]any{
-								"type":        "dynamic-tool",
-								"call_id":     callID,
-								"response_id": strings.TrimSpace(res.ID),
-								"tool_name":   strings.TrimSpace(call.Name),
-								"state":       "output-error",
-								"error_text":  err.ErrorString,
-								"output_len":  len(strings.TrimSpace(errOut)),
-								"output":      stringToMaybeJSONAny(errOut),
-							})
-						}
-						out = errOut
-					} else {
-						out = toolOut
-						if onToolEvent != nil {
-							onToolEvent(map[string]any{
-								"type":        "dynamic-tool",
-								"call_id":     callID,
-								"response_id": strings.TrimSpace(res.ID),
-								"tool_name":   strings.TrimSpace(call.Name),
-								"state":       "output-available",
-								"output":      stringToMaybeJSONAny(toolOut),
-								"output_len":  len(strings.TrimSpace(toolOut)),
-							})
-						}
-					}
-				}
-			}
+			emitToolEvent(onToolEvent, ToolOutputEvent{
+				Iteration:   iteration,
+				Timestamp:   time.Now(),
+				CallID:      callID,
+				ResponseID:  strings.TrimSpace(res.ID),
+				ToolName:    strings.TrimSpace(call.Name),
+				State:       outputState,
+				ErrorString: outputErrText,
+				OutputLen:   len(strings.TrimSpace(out)),
+				Output:      normalizeJSONText(out),
+			})
 			if outputCommand, hashChanged, ok := detectPostTerminalStateFromToolOutput(out); ok {
 				if hashChanged {
 					stalePromptCurrentCommandDetected = true
@@ -387,84 +258,91 @@ func (r *LoopRunner) run(
 					forceRoundModeHintNextIteration = true
 				}
 			}
-			if onToolEvent != nil {
-				onToolEvent(map[string]any{
-					"type":            "agent-debug",
-					"stage":           "responses.roundtrip.item",
-					"iteration":       i + 1,
-					"response_id":     strings.TrimSpace(res.ID),
-					"call_id":         callID,
-					"tool_name":       strings.TrimSpace(call.Name),
-					"function_output": clipForLog(strings.TrimSpace(out), 800),
-					"output_len":      len(strings.TrimSpace(out)),
-				})
-			}
+
 			replayCall := buildReplayFunctionCallInputItem(call)
-			outputItem := map[string]any{
-				"type":    "function_call_output",
-				"call_id": callID,
-				"output":  out,
-			}
+			outputItem := core.ResponseInputItem{Type: "function_call_output", CallID: callID, Output: out}
 			outputs = append(outputs, outputItem)
-			fullContextRoundtripItems = append(fullContextRoundtripItems, replayCall, outputItem)
+			replayItems = append(replayItems, replayCall, outputItem)
 		}
-		if onToolEvent != nil {
-			onToolEvent(map[string]any{
-				"type":                 "agent-debug",
-				"stage":                "responses.roundtrip.prepare",
-				"iteration":            i + 1,
-				"previous_response_id": strings.TrimSpace(res.ID),
-				"roundtrip_mode":       roundtripModeName(fullContextRoundtrip),
-				"items_count":          len(outputs),
-				"items_summary":        summarizeResponseInput(outputs),
-			})
-		}
-		nextReq := CreateResponseRequest{
+
+		emitToolEvent(onToolEvent, RoundtripPreparedEvent{
+			Iteration:          iteration,
+			Timestamp:          time.Now(),
+			PreviousResponseID: strings.TrimSpace(res.ID),
+			RoundtripMode:      roundtripModeName(true),
+			ItemsCount:         len(outputs),
+			ItemsSummary:       summarizeResponseInput(core.NewResponseInputItems(outputs)),
+		})
+
+		historyInputItems = append(historyInputItems, replayItems...)
+		req = core.CreateResponseRequest{
 			Store: boolPtr(storeEnabled),
+			Input: core.NewResponseInputItems(cloneResponseInputItems(historyInputItems)),
 		}
-		if fullContextRoundtrip {
-			historyInputItems = append(historyInputItems, fullContextRoundtripItems...)
-			nextReq.Input = cloneResponseInputItems(historyInputItems)
-		} else {
-			nextReq.Input = outputs
-			nextReq.PreviousResponseID = res.ID
-		}
-		req = nextReq
 		previousRoundMode = currentRoundMode
 	}
 	return "", fmt.Errorf("responses loop exceeded max iterations: %d", r.options.MaxIterations)
 }
 
+func (r *LoopRunner) executeToolCall(
+	ctx context.Context,
+	allowedTools map[string]struct{},
+	allowlistConfigured bool,
+	call core.ToolCall,
+) (string, string, bool) {
+	if r.tools == nil {
+		err := NewToolError("TOOL_REGISTRY_UNAVAILABLE", "Ensure tool registry is initialized and injected into LoopRunner")
+		return mustMarshalToolError(err), err.ErrorString, true
+	}
+	if allowlistConfigured {
+		if _, ok := allowedTools[strings.TrimSpace(call.Name)]; !ok {
+			err := NewToolError(
+				"TOOL_NOT_ENABLED_IN_MODE",
+				fmt.Sprintf("Tool %q is not in current allowed_tools; switch mode or adjust allowlist, then retry", strings.TrimSpace(call.Name)),
+			)
+			return mustMarshalToolError(err), err.ErrorString, true
+		}
+	}
+	toolOut, err := r.tools.Execute(ctx, struct{}{}, call.Name, call.Arguments, call.CallID)
+	if err != nil {
+		return mustMarshalToolError(err), err.ErrorString, true
+	}
+	return toolOut, "", false
+}
+
+func emitToolEvent(onToolEvent func(LoopEvent), event LoopEvent) {
+	if onToolEvent == nil {
+		return
+	}
+	onToolEvent(event)
+}
+
 func withRoundModeHintInputWhen(
-	input any,
+	input core.ResponseInput,
 	allowedTools map[string]struct{},
 	allowlistConfigured bool,
 	enable bool,
-) any {
-	if !enable {
-		return input
-	}
-	items, ok := input.([]map[string]any)
-	if !ok {
+) core.ResponseInput {
+	if !enable || len(input.Items) == 0 {
 		return input
 	}
 	hint := buildRoundModeHintInputItem(allowedTools, allowlistConfigured)
-	if hint == nil {
+	if hint.Type == "" {
 		return input
 	}
-	out := make([]map[string]any, 0, len(items)+1)
+	items := cloneResponseInputItems(input.Items)
+	out := make([]core.ResponseInputItem, 0, len(items)+1)
 	if len(items) > 0 {
 		first := items[0]
-		if strings.TrimSpace(fmt.Sprint(first["type"])) == "message" && strings.TrimSpace(fmt.Sprint(first["role"])) == "system" {
-			out = append(out, first)
-			out = append(out, hint)
+		if strings.TrimSpace(first.Type) == "message" && strings.TrimSpace(first.Role) == "system" {
+			out = append(out, first, hint)
 			out = append(out, items[1:]...)
-			return out
+			return core.NewResponseInputItems(out)
 		}
 	}
 	out = append(out, hint)
 	out = append(out, items...)
-	return out
+	return core.NewResponseInputItems(out)
 }
 
 func resolveRoundModeFromAllowedTools(allowedTools map[string]struct{}, allowlistConfigured bool) string {
@@ -485,59 +363,46 @@ func resolveRoundModeFromAllowedTools(allowedTools map[string]struct{}, allowlis
 	}
 }
 
-func clearCurrentCommandFromResponseInput(input any) (any, bool) {
-	items, ok := input.([]map[string]any)
-	if !ok {
+func clearCurrentCommandFromResponseInput(input core.ResponseInput) (core.ResponseInput, bool) {
+	if len(input.Items) == 0 {
 		return input, false
 	}
-	updated, changed := clearCurrentCommandInInputItems(items)
+	updated, changed := clearCurrentCommandInInputItems(input.Items)
 	if !changed {
 		return input, false
 	}
-	return updated, true
+	return core.NewResponseInputItems(updated), true
 }
 
-func clearCurrentCommandInInputItems(items []map[string]any) ([]map[string]any, bool) {
+func clearCurrentCommandInInputItems(items []core.ResponseInputItem) ([]core.ResponseInputItem, bool) {
 	if len(items) == 0 {
 		return items, false
 	}
-	out := make([]map[string]any, len(items))
-	copy(out, items)
+	out := cloneResponseInputItems(items)
 	changed := false
 	for i, item := range items {
-		if strings.TrimSpace(fmt.Sprint(item["type"])) != "message" || strings.TrimSpace(fmt.Sprint(item["role"])) != "user" {
+		if strings.TrimSpace(item.Type) != "message" || strings.TrimSpace(item.Role) != "user" {
 			continue
 		}
-		rawContent, ok := item["content"]
-		if !ok {
-			continue
-		}
-		parts, ok := normalizeMessageContentParts(rawContent)
-		if !ok || len(parts) == 0 {
-			continue
-		}
-		nextParts := make([]map[string]any, len(parts))
-		copy(nextParts, parts)
+		nextParts := make([]core.ResponseInputContentPart, len(item.Content))
+		copy(nextParts, item.Content)
 		partChanged := false
-		for idx, part := range parts {
-			if strings.TrimSpace(fmt.Sprint(part["type"])) != "input_text" {
+		for idx, part := range item.Content {
+			if strings.TrimSpace(part.Type) != "input_text" {
 				continue
 			}
-			rawText, _ := part["text"].(string)
-			nextText, textChanged := clearCurrentCommandInPromptText(rawText)
+			nextText, textChanged := clearCurrentCommandInPromptText(part.Text)
 			if !textChanged {
 				continue
 			}
-			updatedPart := cloneMap(part)
-			updatedPart["text"] = nextText
-			nextParts[idx] = updatedPart
+			nextParts[idx].Text = nextText
 			partChanged = true
 		}
 		if !partChanged {
 			continue
 		}
-		updatedItem := cloneMap(item)
-		updatedItem["content"] = nextParts
+		updatedItem := item
+		updatedItem.Content = nextParts
 		out[i] = updatedItem
 		changed = true
 	}
@@ -547,73 +412,44 @@ func clearCurrentCommandInInputItems(items []map[string]any) ([]map[string]any, 
 	return out, true
 }
 
-func normalizeMessageContentParts(raw any) ([]map[string]any, bool) {
-	switch v := raw.(type) {
-	case []map[string]any:
-		out := make([]map[string]any, len(v))
-		copy(out, v)
-		return out, true
-	case []any:
-		out := make([]map[string]any, 0, len(v))
-		for _, item := range v {
-			part, ok := item.(map[string]any)
-			if !ok {
-				return nil, false
-			}
-			out = append(out, part)
-		}
-		return out, true
-	default:
-		return nil, false
-	}
-}
+var promptCurrentCommandPattern = regexp.MustCompile(`"current_command"\s*:\s*"((?:\\.|[^"\\])*)"`)
 
 func extractPromptCurrentCommand(prompt string) (string, bool) {
-	decoded, _, _, ok := extractPromptTaskContextJSON(prompt)
+	start, end, ok := extractPromptJSONObjectRange(prompt, "terminal_screen_state_json:")
 	if !ok {
 		return "", false
 	}
-	screen, ok := decoded["terminal_screen_state"].(map[string]any)
-	if !ok {
+	segment := prompt[start:end]
+	matches := promptCurrentCommandPattern.FindStringSubmatch(segment)
+	if len(matches) < 2 {
 		return "", false
 	}
-	raw := strings.TrimSpace(fmt.Sprint(screen["current_command"]))
-	if raw == "" || raw == "<nil>" {
+	decoded, err := strconv.Unquote("\"" + matches[1] + "\"")
+	if err != nil {
 		return "", false
 	}
-	return raw, true
+	decoded = strings.TrimSpace(decoded)
+	if decoded == "" {
+		return "", false
+	}
+	return decoded, true
 }
 
 func clearCurrentCommandInPromptText(prompt string) (string, bool) {
-	decoded, start, end, ok := extractPromptTaskContextJSON(prompt)
-	if !ok {
-		return prompt, false
-	}
-	screen, ok := decoded["terminal_screen_state"].(map[string]any)
-	if !ok {
-		return prompt, false
-	}
-	if _, exists := screen["current_command"]; !exists {
-		return prompt, false
-	}
-	screen["current_command"] = ""
-	nextRaw, err := json.Marshal(decoded)
-	if err != nil {
-		return prompt, false
-	}
-	return prompt[:start] + string(nextRaw) + prompt[end:], true
-}
-
-func extractPromptTaskContextJSON(prompt string) (map[string]any, int, int, bool) {
 	start, end, ok := extractPromptJSONObjectRange(prompt, "terminal_screen_state_json:")
 	if !ok {
-		return nil, 0, 0, false
+		return prompt, false
 	}
-	var decoded map[string]any
-	if err := json.Unmarshal([]byte(prompt[start:end]), &decoded); err != nil {
-		return nil, 0, 0, false
+	segment := prompt[start:end]
+	loc := promptCurrentCommandPattern.FindStringIndex(segment)
+	if loc == nil {
+		return prompt, false
 	}
-	return decoded, start, end, true
+	replaced := promptCurrentCommandPattern.ReplaceAllString(segment, `"current_command":""`)
+	if replaced == segment {
+		return prompt, false
+	}
+	return prompt[:start] + replaced + prompt[end:], true
 }
 
 func extractPromptSystemContextJSON(prompt string) (string, bool) {
@@ -732,68 +568,35 @@ func findJSONObjectEnd(input string, start int) (int, bool) {
 	return 0, false
 }
 
+type postTerminalScreenStateEnvelope struct {
+	Data struct {
+		PostTerminalScreenState postTerminalScreenState `json:"post_terminal_screen_state"`
+	} `json:"data"`
+	PostTerminalScreenState postTerminalScreenState `json:"post_terminal_screen_state"`
+}
+
+type postTerminalScreenState struct {
+	CurrentCommand string `json:"current_command"`
+	HashChanged    bool   `json:"hash_changed"`
+}
+
 func detectPostTerminalStateFromToolOutput(output string) (string, bool, bool) {
 	trimmed := strings.TrimSpace(output)
 	if trimmed == "" {
 		return "", false, false
 	}
-	var decoded map[string]any
+	var decoded postTerminalScreenStateEnvelope
 	if err := json.Unmarshal([]byte(trimmed), &decoded); err != nil {
 		return "", false, false
 	}
-	screen := nestedMap(decoded, "data", "post_terminal_screen_state")
-	if screen == nil {
-		screen = nestedMap(decoded, "post_terminal_screen_state")
+	screen := decoded.Data.PostTerminalScreenState
+	if strings.TrimSpace(screen.CurrentCommand) == "" && !screen.HashChanged {
+		screen = decoded.PostTerminalScreenState
 	}
-	if screen == nil {
+	if strings.TrimSpace(screen.CurrentCommand) == "" && !screen.HashChanged {
 		return "", false, false
 	}
-	currentCommand := strings.TrimSpace(fmt.Sprint(screen["current_command"]))
-	if currentCommand == "<nil>" {
-		currentCommand = ""
-	}
-	return currentCommand, boolFromAny(screen["hash_changed"]), true
-}
-
-func nestedMap(root map[string]any, keys ...string) map[string]any {
-	cur := root
-	for i, key := range keys {
-		raw, ok := cur[key]
-		if !ok {
-			return nil
-		}
-		next, ok := raw.(map[string]any)
-		if !ok {
-			return nil
-		}
-		if i == len(keys)-1 {
-			return next
-		}
-		cur = next
-	}
-	return nil
-}
-
-func boolFromAny(v any) bool {
-	switch x := v.(type) {
-	case bool:
-		return x
-	case string:
-		return strings.EqualFold(strings.TrimSpace(x), "true")
-	default:
-		return strings.EqualFold(strings.TrimSpace(fmt.Sprint(v)), "true")
-	}
-}
-
-func cloneMap(in map[string]any) map[string]any {
-	if len(in) == 0 {
-		return map[string]any{}
-	}
-	out := make(map[string]any, len(in))
-	for k, v := range in {
-		out[k] = v
-	}
-	return out
+	return strings.TrimSpace(screen.CurrentCommand), screen.HashChanged, true
 }
 
 func sortedReasonKeys(reasons map[string]struct{}) []string {
@@ -812,7 +615,7 @@ func sortedReasonKeys(reasons map[string]struct{}) []string {
 	return keys
 }
 
-func buildRoundModeHintInputItem(allowedTools map[string]struct{}, allowlistConfigured bool) map[string]any {
+func buildRoundModeHintInputItem(allowedTools map[string]struct{}, allowlistConfigured bool) core.ResponseInputItem {
 	mode := "default"
 	if allowlistConfigured {
 		if _, ok := allowedTools["task.input_prompt"]; ok {
@@ -842,19 +645,17 @@ func buildRoundModeHintInputItem(allowedTools map[string]struct{}, allowlistConf
 		"Authoritative mode for this round is derived from allowed_tools; ignore stale terminal snapshots from earlier messages.",
 		"Never call tools that are not listed in allowed_tools for this round.",
 	}, "\n"))
-	return map[string]any{
-		"type": "message",
-		"role": "user",
-		"content": []map[string]any{
-			{
-				"type": "input_text",
-				"text": text,
-			},
-		},
+	return core.ResponseInputItem{
+		Type: "message",
+		Role: "user",
+		Content: []core.ResponseInputContentPart{{
+			Type: "input_text",
+			Text: text,
+		}},
 	}
 }
 
-func (r *LoopRunner) resolveToolSpecs(allowedTools map[string]struct{}, allowlistConfigured bool) []ResponseToolSpec {
+func (r *LoopRunner) resolveToolSpecs(allowedTools map[string]struct{}, allowlistConfigured bool) []core.ResponseToolSpec {
 	if r == nil || r.tools == nil {
 		return nil
 	}
@@ -862,7 +663,7 @@ func (r *LoopRunner) resolveToolSpecs(allowedTools map[string]struct{}, allowlis
 		return r.tools.Specs()
 	}
 	if len(allowedTools) == 0 {
-		return []ResponseToolSpec{}
+		return []core.ResponseToolSpec{}
 	}
 	names := make([]string, 0, len(allowedTools))
 	for name := range allowedTools {
@@ -887,27 +688,16 @@ func allowedToolNameSetFromContext(ctx context.Context) (map[string]struct{}, bo
 	return out, true
 }
 
-func rawJSONToAny(raw json.RawMessage) any {
-	if len(raw) == 0 {
-		return nil
-	}
-	var out any
-	if err := json.Unmarshal(raw, &out); err != nil {
-		return string(raw)
-	}
-	return out
-}
-
-func stringToMaybeJSONAny(text string) any {
+func normalizeJSONText(text string) string {
 	trimmed := strings.TrimSpace(text)
 	if trimmed == "" {
 		return ""
 	}
-	var out any
-	if err := json.Unmarshal([]byte(trimmed), &out); err != nil {
-		return text
+	if json.Valid([]byte(trimmed)) {
+		return trimmed
 	}
-	return out
+	enc, _ := json.Marshal(trimmed)
+	return string(enc)
 }
 
 func summarizeEventTrace(trace []string) string {
@@ -930,7 +720,7 @@ func clipForLog(text string, limit int) string {
 	return text[:limit] + "...(truncated)"
 }
 
-func summarizeCreateResponseRequest(req CreateResponseRequest) string {
+func summarizeCreateResponseRequest(req core.CreateResponseRequest) string {
 	storeSummary := "<unset>"
 	if req.Store != nil {
 		storeSummary = fmt.Sprintf("%t", *req.Store)
@@ -961,59 +751,53 @@ func roundtripModeName(fullContext bool) string {
 	return "previous_response_id"
 }
 
-func cloneResponseInputItems(in []map[string]any) []map[string]any {
+func cloneResponseInputItems(in []core.ResponseInputItem) []core.ResponseInputItem {
 	if len(in) == 0 {
-		return []map[string]any{}
+		return []core.ResponseInputItem{}
 	}
-	out := make([]map[string]any, 0, len(in))
-	for _, item := range in {
-		out = append(out, item)
-	}
+	out := make([]core.ResponseInputItem, len(in))
+	copy(out, in)
 	return out
 }
 
-func buildUserMessageInputItem(text string) map[string]any {
-	return map[string]any{
-		"type": "message",
-		"role": "user",
-		"content": []map[string]any{
-			{
-				"type": "input_text",
-				"text": strings.TrimSpace(text),
-			},
-		},
+func buildUserMessageInputItem(text string) core.ResponseInputItem {
+	return core.ResponseInputItem{
+		Type: "message",
+		Role: "user",
+		Content: []core.ResponseInputContentPart{{
+			Type: "input_text",
+			Text: strings.TrimSpace(text),
+		}},
 	}
 }
 
-func buildSystemMessageInputItem(text string) map[string]any {
-	return map[string]any{
-		"type": "message",
-		"role": "system",
-		"content": []map[string]any{
-			{
-				"type": "input_text",
-				"text": strings.TrimSpace(text),
-			},
-		},
+func buildSystemMessageInputItem(text string) core.ResponseInputItem {
+	return core.ResponseInputItem{
+		Type: "message",
+		Role: "system",
+		Content: []core.ResponseInputContentPart{{
+			Type: "input_text",
+			Text: strings.TrimSpace(text),
+		}},
 	}
 }
 
-func buildReplayFunctionCallInputItem(call ToolCall) map[string]any {
+func buildReplayFunctionCallInputItem(call core.ToolCall) core.ResponseInputItem {
 	callID := strings.TrimSpace(call.CallID)
 	itemID := strings.TrimSpace(call.ID)
 	if itemID == "" {
 		itemID = callID
 	}
-	arguments := strings.TrimSpace(string(call.Arguments))
+	arguments := strings.TrimSpace(call.Arguments)
 	if arguments == "" {
 		arguments = "{}"
 	}
-	return map[string]any{
-		"type":      "function_call",
-		"id":        itemID,
-		"call_id":   callID,
-		"name":      sanitizeFunctionCallNameForInput(call.Name),
-		"arguments": arguments,
+	return core.ResponseInputItem{
+		Type:      "function_call",
+		ID:        itemID,
+		CallID:    callID,
+		Name:      sanitizeFunctionCallNameForInput(call.Name),
+		Arguments: arguments,
 	}
 }
 
@@ -1038,62 +822,32 @@ func sanitizeFunctionCallNameForInput(name string) string {
 	return out
 }
 
-func summarizeResponseInput(input any) string {
-	switch v := input.(type) {
-	case string:
-		return fmt.Sprintf("text(len=%d)", len(strings.TrimSpace(v)))
-	case []map[string]any:
-		items := make([]map[string]any, 0, len(v))
-		items = append(items, v...)
-		return summarizeResponseInputItems(items)
-	case []any:
-		items := make([]map[string]any, 0, len(v))
-		for _, item := range v {
-			asMap, ok := item.(map[string]any)
-			if !ok {
-				return fmt.Sprintf("items=%d(type_mismatch=%T)", len(v), item)
-			}
-			items = append(items, asMap)
-		}
-		return summarizeResponseInputItems(items)
-	default:
-		raw, err := json.Marshal(v)
-		if err != nil {
-			return fmt.Sprintf("type=%T(marshal_error=%v)", input, err)
-		}
-		trimmed := strings.TrimSpace(string(raw))
-		if len(trimmed) > 160 {
-			trimmed = trimmed[:160] + "...(truncated)"
-		}
-		return fmt.Sprintf("type=%T json=%s", input, trimmed)
+func summarizeResponseInput(input core.ResponseInput) string {
+	if strings.TrimSpace(input.Text) != "" {
+		return fmt.Sprintf("text(len=%d)", len(strings.TrimSpace(input.Text)))
 	}
-}
-
-func summarizeResponseInputItems(items []map[string]any) string {
-	if len(items) == 0 {
+	if len(input.Items) == 0 {
 		return "items=0"
 	}
-	out := make([]string, 0, len(items))
-	for _, item := range items {
-		itemType := strings.TrimSpace(fmt.Sprint(item["type"]))
-		callID := strings.TrimSpace(fmt.Sprint(item["call_id"]))
-		outputLen := len(strings.TrimSpace(fmt.Sprint(item["output"])))
-		token := itemType
-		if token == "" {
-			token = "<empty_type>"
+	out := make([]string, 0, len(input.Items))
+	for _, item := range input.Items {
+		itemType := strings.TrimSpace(item.Type)
+		if itemType == "" {
+			itemType = "<empty_type>"
 		}
-		if callID != "" {
-			token += fmt.Sprintf("(call_id=%s)", callID)
+		token := itemType
+		if strings.TrimSpace(item.CallID) != "" {
+			token += fmt.Sprintf("(call_id=%s)", strings.TrimSpace(item.CallID))
 		}
 		if itemType == "function_call_output" {
-			token += fmt.Sprintf("(output_len=%d)", outputLen)
+			token += fmt.Sprintf("(output_len=%d)", len(strings.TrimSpace(item.Output)))
 		}
 		out = append(out, token)
 	}
-	return fmt.Sprintf("items=%d[%s]", len(items), strings.Join(out, ", "))
+	return fmt.Sprintf("items=%d[%s]", len(input.Items), strings.Join(out, ", "))
 }
 
-func summarizeToolCalls(calls []ToolCall) string {
+func summarizeToolCalls(calls []core.ToolCall) string {
 	if len(calls) == 0 {
 		return "<none>"
 	}
@@ -1105,7 +859,7 @@ func summarizeToolCalls(calls []ToolCall) string {
 			strings.TrimSpace(call.CallID),
 			strings.TrimSpace(call.ID),
 			strings.TrimSpace(call.ResponseID),
-			len(strings.TrimSpace(string(call.Arguments))),
+			len(strings.TrimSpace(call.Arguments)),
 		))
 	}
 	return strings.Join(out, ", ")

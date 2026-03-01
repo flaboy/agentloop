@@ -2,7 +2,6 @@ package core
 
 import (
 	"context"
-	"encoding/json"
 	"reflect"
 	"testing"
 )
@@ -21,7 +20,7 @@ func (t registryTestTool) Spec() ResponseToolSpec {
 	return ResponseToolSpec{Type: "function", Name: t.name}
 }
 
-func (t registryTestTool) Execute(_ context.Context, _ registryTestState, _ json.RawMessage, _ string) (string, *ToolError) {
+func (t registryTestTool) Execute(_ context.Context, _ registryTestState, _ string, _ string) (string, *ToolError) {
 	return "ok", nil
 }
 

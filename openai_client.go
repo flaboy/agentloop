@@ -8,15 +8,19 @@ import (
 	"net/http"
 	"strings"
 
+	core "github.com/flaboy/agentloop/core"
 	"github.com/openai/openai-go/option"
 	"github.com/openai/openai-go/packages/param"
 	"github.com/openai/openai-go/responses"
 )
 
 type OpenAIConfig struct {
-	BaseURL string
-	Model   string
-	APIKey  string
+	BaseURL         string
+	Model           string
+	APIKey          string
+	ReasoningEffort string
+	UseResponsesAPI bool
+	EnableState     bool
 }
 
 type ResponsesClient struct {
@@ -41,7 +45,13 @@ func NewResponsesClient(cfg OpenAIConfig, httpClient *http.Client) *ResponsesCli
 	}
 }
 
-func (c *ResponsesClient) CreateResponse(ctx context.Context, req CreateResponseRequest) (*CreateResponseResult, error) {
+func (c *ResponsesClient) CreateResponse(ctx context.Context, req core.CreateResponseRequest) (*core.CreateResponseResult, error) {
+	if c == nil {
+		return nil, errors.New("responses client is nil")
+	}
+	if !c.cfg.UseResponsesAPI {
+		return nil, errors.New("responses api is disabled by config")
+	}
 	req.Stream = false
 	params, err := c.toSDKRequest(req)
 	if err != nil {
@@ -50,12 +60,14 @@ func (c *ResponsesClient) CreateResponse(ctx context.Context, req CreateResponse
 	emitResponsesRequestRaw(ctx, marshalJSONForDebug(params))
 	var rawResp *http.Response
 	var rawBody []byte
-	_, err = c.service.New(
-		ctx,
-		params,
+	requestOpts := []option.RequestOption{
 		option.WithResponseInto(&rawResp),
 		option.WithResponseBodyInto(&rawBody),
-	)
+	}
+	if c.cfg.EnableState {
+		requestOpts = append(requestOpts, option.WithJSONSet("state", true))
+	}
+	_, err = c.service.New(ctx, params, requestOpts...)
 	if err != nil {
 		return nil, c.wrapRequestError(err, req, rawResp)
 	}
@@ -66,7 +78,13 @@ func (c *ResponsesClient) CreateResponse(ctx context.Context, req CreateResponse
 	return parseResponseResult(rawBody)
 }
 
-func (c *ResponsesClient) CreateResponseStream(ctx context.Context, req CreateResponseRequest, onTextDelta func(string)) (*CreateResponseResult, error) {
+func (c *ResponsesClient) CreateResponseStream(ctx context.Context, req core.CreateResponseRequest, onTextDelta func(string)) (*core.CreateResponseResult, error) {
+	if c == nil {
+		return nil, errors.New("responses client is nil")
+	}
+	if !c.cfg.UseResponsesAPI {
+		return nil, errors.New("responses api is disabled by config")
+	}
 	req.Stream = true
 	params, err := c.toSDKRequest(req)
 	if err != nil {
@@ -74,7 +92,11 @@ func (c *ResponsesClient) CreateResponseStream(ctx context.Context, req CreateRe
 	}
 	emitResponsesRequestRaw(ctx, marshalJSONForDebug(params))
 	var rawResp *http.Response
-	stream := c.service.NewStreaming(ctx, params, option.WithResponseInto(&rawResp))
+	requestOpts := []option.RequestOption{option.WithResponseInto(&rawResp)}
+	if c.cfg.EnableState {
+		requestOpts = append(requestOpts, option.WithJSONSet("state", true))
+	}
+	stream := c.service.NewStreaming(ctx, params, requestOpts...)
 	if stream == nil {
 		return nil, fmt.Errorf("responses stream unavailable request=%s", summarizeCreateResponseRequest(req))
 	}
@@ -82,11 +104,11 @@ func (c *ResponsesClient) CreateResponseStream(ctx context.Context, req CreateRe
 		_ = stream.Close()
 	}()
 
-	out := &CreateResponseResult{}
+	out := &core.CreateResponseResult{}
 	eventTrace := make([]string, 0, 32)
 	sawTextDelta := false
 	toolCallOrder := make([]string, 0, 8)
-	toolCallsByKey := map[string]*ToolCall{}
+	toolCallsByKey := map[string]*core.ToolCall{}
 	itemToKey := map[string]string{}
 	argumentByKey := map[string]string{}
 
@@ -114,7 +136,7 @@ func (c *ResponsesClient) CreateResponseStream(ctx context.Context, req CreateRe
 		}
 		return ""
 	}
-	ensureToolCall := func(key string) *ToolCall {
+	ensureToolCall := func(key string) *core.ToolCall {
 		key = strings.TrimSpace(key)
 		if key == "" {
 			return nil
@@ -122,7 +144,7 @@ func (c *ResponsesClient) CreateResponseStream(ctx context.Context, req CreateRe
 		if existing, ok := toolCallsByKey[key]; ok {
 			return existing
 		}
-		tc := &ToolCall{}
+		tc := &core.ToolCall{}
 		toolCallsByKey[key] = tc
 		toolCallOrder = append(toolCallOrder, key)
 		return tc
@@ -135,8 +157,8 @@ func (c *ResponsesClient) CreateResponseStream(ctx context.Context, req CreateRe
 		}
 		itemToKey[itemID] = key
 	}
-	buildToolCalls := func() []ToolCall {
-		outCalls := make([]ToolCall, 0, len(toolCallOrder))
+	buildToolCalls := func() []core.ToolCall {
+		outCalls := make([]core.ToolCall, 0, len(toolCallOrder))
 		for _, key := range toolCallOrder {
 			tc := toolCallsByKey[key]
 			if tc == nil {
@@ -163,7 +185,7 @@ func (c *ResponsesClient) CreateResponseStream(ctx context.Context, req CreateRe
 			return
 		}
 		argumentByKey[key] = arguments
-		tc.Arguments = json.RawMessage(strings.TrimSpace(argumentByKey[key]))
+		tc.Arguments = strings.TrimSpace(argumentByKey[key])
 		for _, candidate := range candidates {
 			rememberItemKey(candidate, key)
 		}
@@ -182,13 +204,13 @@ func (c *ResponsesClient) CreateResponseStream(ctx context.Context, req CreateRe
 		}
 		argumentByKey[key] += delta
 		if merged := strings.TrimSpace(argumentByKey[key]); merged != "" {
-			tc.Arguments = json.RawMessage(merged)
+			tc.Arguments = merged
 		}
 		for _, candidate := range candidates {
 			rememberItemKey(candidate, key)
 		}
 	}
-	mergeToolCall := func(call ToolCall, eventItemID, eventResponseID string) {
+	mergeToolCall := func(call core.ToolCall, eventItemID, eventResponseID string) {
 		key := resolveToolCallKey(call.CallID, call.ID, eventItemID)
 		if key == "" {
 			return
@@ -215,9 +237,9 @@ func (c *ResponsesClient) CreateResponseStream(ctx context.Context, req CreateRe
 			}
 		}
 		deltaArgs := strings.TrimSpace(argumentByKey[key])
-		itemArgs := strings.TrimSpace(string(call.Arguments))
+		itemArgs := strings.TrimSpace(call.Arguments)
 		if deltaArgs != "" {
-			tc.Arguments = json.RawMessage(deltaArgs)
+			tc.Arguments = deltaArgs
 		} else if itemArgs != "" {
 			tc.Arguments = call.Arguments
 		}
@@ -330,8 +352,8 @@ func (c *ResponsesClient) CreateResponseStream(ctx context.Context, req CreateRe
 	return out, nil
 }
 
-func (c *ResponsesClient) toSDKRequest(req CreateResponseRequest) (responses.ResponseNewParams, error) {
-	if err := ValidateResponseInputInvariants(req.Input); err != nil {
+func (c *ResponsesClient) toSDKRequest(req core.CreateResponseRequest) (responses.ResponseNewParams, error) {
+	if err := core.ValidateResponseInputInvariants(req.Input); err != nil {
 		return responses.ResponseNewParams{}, fmt.Errorf("invalid responses input invariants: %w", err)
 	}
 	var out responses.ResponseNewParams
@@ -341,6 +363,18 @@ func (c *ResponsesClient) toSDKRequest(req CreateResponseRequest) (responses.Res
 	}
 	if model != "" {
 		out.Model = model
+	}
+	if effort := strings.ToLower(strings.TrimSpace(c.cfg.ReasoningEffort)); effort != "" {
+		switch effort {
+		case string(responses.ReasoningEffortLow):
+			out.Reasoning = responses.ReasoningParam{Effort: responses.ReasoningEffortLow}
+		case string(responses.ReasoningEffortMedium):
+			out.Reasoning = responses.ReasoningParam{Effort: responses.ReasoningEffortMedium}
+		case string(responses.ReasoningEffortHigh):
+			out.Reasoning = responses.ReasoningParam{Effort: responses.ReasoningEffortHigh}
+		default:
+			return responses.ResponseNewParams{}, fmt.Errorf("invalid reasoning effort: %q", effort)
+		}
 	}
 	if req.Store != nil {
 		out.Store = param.NewOpt(*req.Store)
@@ -363,67 +397,28 @@ func (c *ResponsesClient) toSDKRequest(req CreateResponseRequest) (responses.Res
 	return out, nil
 }
 
-func toSDKInput(input any) (responses.ResponseNewParamsInputUnion, error) {
+func toSDKInput(input core.ResponseInput) (responses.ResponseNewParamsInputUnion, error) {
 	var out responses.ResponseNewParamsInputUnion
-	if input == nil {
+	if strings.TrimSpace(input.Text) == "" && len(input.Items) == 0 {
 		return out, nil
 	}
-	switch v := input.(type) {
-	case string:
-		out.OfString = param.NewOpt(v)
+	if strings.TrimSpace(input.Text) != "" {
+		out.OfString = param.NewOpt(input.Text)
 		return out, nil
-	case []map[string]any:
-		items := make(responses.ResponseInputParam, 0, len(v))
-		for i, rawItem := range v {
-			item, err := toSDKInputItem(rawItem)
-			if err != nil {
-				return responses.ResponseNewParamsInputUnion{}, fmt.Errorf("invalid response input item[%d]: %w", i, err)
-			}
-			items = append(items, item)
-		}
-		out.OfInputItemList = items
-		return out, nil
-	case []any:
-		items := make(responses.ResponseInputParam, 0, len(v))
-		for i, rawItem := range v {
-			item, err := toSDKInputItem(rawItem)
-			if err != nil {
-				return responses.ResponseNewParamsInputUnion{}, fmt.Errorf("invalid response input item[%d]: %w", i, err)
-			}
-			items = append(items, item)
-		}
-		out.OfInputItemList = items
-		return out, nil
-	default:
-		raw, err := json.Marshal(input)
+	}
+	items := make(responses.ResponseInputParam, 0, len(input.Items))
+	for i, rawItem := range input.Items {
+		item, err := toSDKInputItem(rawItem)
 		if err != nil {
-			return responses.ResponseNewParamsInputUnion{}, fmt.Errorf("marshal response input failed: %w", err)
+			return responses.ResponseNewParamsInputUnion{}, fmt.Errorf("invalid response input item[%d]: %w", i, err)
 		}
-		trimmed := strings.TrimSpace(string(raw))
-		if trimmed == "" || trimmed == "null" {
-			return out, nil
-		}
-		if strings.HasPrefix(trimmed, "[") {
-			var items []responses.ResponseInputItemUnionParam
-			if err := json.Unmarshal(raw, &items); err != nil {
-				return responses.ResponseNewParamsInputUnion{}, fmt.Errorf("decode response input list failed: %w", err)
-			}
-			out.OfInputItemList = items
-			return out, nil
-		}
-		if strings.HasPrefix(trimmed, "\"") {
-			var text string
-			if err := json.Unmarshal(raw, &text); err != nil {
-				return responses.ResponseNewParamsInputUnion{}, fmt.Errorf("decode response input text failed: %w", err)
-			}
-			out.OfString = param.NewOpt(text)
-			return out, nil
-		}
-		return responses.ResponseNewParamsInputUnion{}, fmt.Errorf("unsupported response input type=%T", input)
+		items = append(items, item)
 	}
+	out.OfInputItemList = items
+	return out, nil
 }
 
-func toSDKInputItem(rawItem any) (responses.ResponseInputItemUnionParam, error) {
+func toSDKInputItem(rawItem core.ResponseInputItem) (responses.ResponseInputItemUnionParam, error) {
 	raw, err := json.Marshal(rawItem)
 	if err != nil {
 		return responses.ResponseInputItemUnionParam{}, fmt.Errorf("marshal response input item failed: %w", err)
@@ -435,7 +430,7 @@ func toSDKInputItem(rawItem any) (responses.ResponseInputItemUnionParam, error) 
 	return out, nil
 }
 
-func toSDKTools(tools []ResponseToolSpec) ([]responses.ToolUnionParam, error) {
+func toSDKTools(tools []core.ResponseToolSpec) ([]responses.ToolUnionParam, error) {
 	out := make([]responses.ToolUnionParam, 0, len(tools))
 	for i, spec := range tools {
 		raw, err := json.Marshal(spec)
@@ -451,7 +446,7 @@ func toSDKTools(tools []ResponseToolSpec) ([]responses.ToolUnionParam, error) {
 	return out, nil
 }
 
-func parseResponseResult(raw []byte) (*CreateResponseResult, error) {
+func parseResponseResult(raw []byte) (*core.CreateResponseResult, error) {
 	var decoded responsePayload
 	if err := json.Unmarshal(raw, &decoded); err != nil {
 		return nil, err
@@ -465,7 +460,7 @@ func parseResponseResult(raw []byte) (*CreateResponseResult, error) {
 		}
 		return nil, fmt.Errorf("responses api failed response_id=%q code=%q message=%q", strings.TrimSpace(decoded.ID), code, message)
 	}
-	out := &CreateResponseResult{ID: strings.TrimSpace(decoded.ID)}
+	out := &core.CreateResponseResult{ID: strings.TrimSpace(decoded.ID)}
 	for _, item := range decoded.Output {
 		if call, ok := toToolCall(item); ok {
 			if strings.TrimSpace(call.ResponseID) == "" {
@@ -479,7 +474,7 @@ func parseResponseResult(raw []byte) (*CreateResponseResult, error) {
 	return out, nil
 }
 
-func (c *ResponsesClient) wrapRequestError(err error, req CreateResponseRequest, rawResp *http.Response) error {
+func (c *ResponsesClient) wrapRequestError(err error, req core.CreateResponseRequest, rawResp *http.Response) error {
 	var apiErr *responses.Error
 	if errors.As(err, &apiErr) {
 		resp := rawResp
@@ -571,20 +566,20 @@ func summarizeResponseHeaders(resp *http.Response) string {
 	return "{" + strings.Join(parts, ",") + "}"
 }
 
-func toToolCall(item responseItem) (ToolCall, bool) {
+func toToolCall(item responseItem) (core.ToolCall, bool) {
 	if strings.TrimSpace(item.Type) != "function_call" {
-		return ToolCall{}, false
+		return core.ToolCall{}, false
 	}
-	return ToolCall{
+	return core.ToolCall{
 		ID:         strings.TrimSpace(item.ID),
 		CallID:     strings.TrimSpace(item.CallID),
 		ResponseID: strings.TrimSpace(item.ResponseID),
 		Name:       strings.TrimSpace(item.Name),
-		Arguments:  json.RawMessage(item.Arguments),
+		Arguments:  strings.TrimSpace(item.Arguments),
 	}, true
 }
 
-func appendMessageText(out *CreateResponseResult, parts []responseContentPart) {
+func appendMessageText(out *core.CreateResponseResult, parts []responseContentPart) {
 	if out == nil {
 		return
 	}
@@ -610,7 +605,7 @@ func appendEventTrace(trace []string, entry string) []string {
 	return append(trace, entry)
 }
 
-func marshalJSONForDebug(v any) string {
+func marshalJSONForDebug(v responses.ResponseNewParams) string {
 	raw, err := json.Marshal(v)
 	if err != nil {
 		return fmt.Sprintf("{\"marshal_error\":%q}", err.Error())

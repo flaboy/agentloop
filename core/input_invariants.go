@@ -5,9 +5,8 @@ import (
 	"strings"
 )
 
-func ValidateResponseInputInvariants(input any) error {
-	items, ok := normalizeResponseInputItems(input)
-	if !ok {
+func ValidateResponseInputInvariants(input ResponseInput) error {
+	if len(input.Items) == 0 {
 		return nil
 	}
 
@@ -15,9 +14,9 @@ func ValidateResponseInputInvariants(input any) error {
 	systemIndex := -1
 	seenCallIDs := map[string]struct{}{}
 
-	for i, item := range items {
-		itemType := fieldString(item["type"])
-		role := fieldString(item["role"])
+	for i, item := range input.Items {
+		itemType := strings.TrimSpace(item.Type)
+		role := strings.TrimSpace(item.Role)
 
 		if itemType == "message" && role == "system" {
 			systemCount++
@@ -25,14 +24,14 @@ func ValidateResponseInputInvariants(input any) error {
 		}
 
 		if itemType == "function_call" {
-			callID := fieldString(item["call_id"])
+			callID := strings.TrimSpace(item.CallID)
 			if callID != "" {
 				seenCallIDs[callID] = struct{}{}
 			}
 		}
 
 		if itemType == "function_call_output" {
-			callID := fieldString(item["call_id"])
+			callID := strings.TrimSpace(item.CallID)
 			if callID == "" {
 				return fmt.Errorf("function_call_output missing call_id at index=%d", i)
 			}
@@ -49,31 +48,4 @@ func ValidateResponseInputInvariants(input any) error {
 		return fmt.Errorf("responses input system message must be first, got index=%d", systemIndex)
 	}
 	return nil
-}
-
-func fieldString(v any) string {
-	value := strings.TrimSpace(fmt.Sprint(v))
-	if value == "<nil>" {
-		return ""
-	}
-	return value
-}
-
-func normalizeResponseInputItems(input any) ([]map[string]any, bool) {
-	switch v := input.(type) {
-	case []map[string]any:
-		return v, true
-	case []any:
-		items := make([]map[string]any, 0, len(v))
-		for _, raw := range v {
-			item, ok := raw.(map[string]any)
-			if !ok {
-				return nil, false
-			}
-			items = append(items, item)
-		}
-		return items, true
-	default:
-		return nil, false
-	}
 }
