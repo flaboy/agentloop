@@ -104,11 +104,6 @@ func (r *LoopRunner) run(
 
 	for i := 0; i < r.options.MaxIterations; i++ {
 		iteration := i + 1
-		allowedTools, allowlistConfigured := allowedToolNameSetFromContext(ctx)
-		if r.tools != nil {
-			req.Tools = r.resolveToolSpecs(allowedTools, allowlistConfigured)
-		}
-
 		callReq := req
 		if err := core.ValidateResponseInputInvariants(callReq.Input); err != nil {
 			base := fmt.Sprintf("responses input invariant failed iteration=%d %s", iteration, summarizeCreateResponseRequest(callReq))
@@ -135,6 +130,10 @@ func (r *LoopRunner) run(
 			Request:   &callReq,
 		}
 		err = r.runHookChain(HookPointModelCall, modelHookCtx, func() error {
+			allowedTools, allowlistConfigured := modelHookCtx.AllowedToolNameSet()
+			if r.tools != nil {
+				modelHookCtx.Request.Tools = r.resolveToolSpecs(allowedTools, allowlistConfigured)
+			}
 			if onTextDelta != nil {
 				if streamClient, ok := r.client.(ResponsesStreamAPI); ok {
 					res, err = streamClient.CreateResponseStream(callCtx, *modelHookCtx.Request, onTextDelta)
@@ -151,6 +150,7 @@ func (r *LoopRunner) run(
 			return err
 		})
 		res = modelHookCtx.Response
+		allowedTools, allowlistConfigured := modelHookCtx.AllowedToolNameSet()
 		if err != nil {
 			base := fmt.Sprintf("responses request failed iteration=%d %s", iteration, reqSummary)
 			if strings.TrimSpace(lastResponseTrace) != "" {
@@ -462,22 +462,6 @@ func (r *LoopRunner) resolveToolSpecs(allowedTools map[string]struct{}, allowlis
 		names = append(names, name)
 	}
 	return r.tools.SpecsByNames(names)
-}
-
-func allowedToolNameSetFromContext(ctx context.Context) (map[string]struct{}, bool) {
-	names, ok := AllowedToolNamesFromContext(ctx)
-	if !ok {
-		return nil, false
-	}
-	out := map[string]struct{}{}
-	for _, name := range names {
-		name = strings.TrimSpace(name)
-		if name == "" {
-			continue
-		}
-		out[name] = struct{}{}
-	}
-	return out, true
 }
 
 func normalizeJSONText(text string) string {
