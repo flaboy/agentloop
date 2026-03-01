@@ -3,14 +3,11 @@ package agentloop
 import (
 	"context"
 	"encoding/json"
+
+	core "github.com/flaboy/agentloop/core"
 )
 
-type ResponseToolSpec struct {
-	Type        string         `json:"type"`
-	Name        string         `json:"name"`
-	Description string         `json:"description,omitempty"`
-	Parameters  map[string]any `json:"parameters,omitempty"`
-}
+type ResponseToolSpec = core.ResponseToolSpec
 
 type Tool interface {
 	Name() string

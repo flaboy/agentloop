@@ -1,27 +1,18 @@
 package agentloop
 
-import "encoding/json"
+import (
+	"encoding/json"
 
-type ToolError struct {
-	Message string `json:"error"`
-	Suggest string `json:"suggest"`
-}
+	core "github.com/flaboy/agentloop/core"
+)
 
-func (e *ToolError) Error() string {
-	if e == nil {
-		return "UNKNOWN_ERROR"
-	}
-	if e.Message == "" {
-		return "UNKNOWN_ERROR"
-	}
-	return e.Message
-}
+type ToolError = core.ToolError
 
-func NewToolError(message, suggest string) *ToolError {
-	if suggest == "" {
-		suggest = "NO_SUGGESTION"
+func NewToolError(errorString, suggestString string) *ToolError {
+	if suggestString == "" {
+		suggestString = "NO_SUGGESTION"
 	}
-	return &ToolError{Message: message, Suggest: suggest}
+	return core.NewToolError(errorString, suggestString)
 }
 
 func mustMarshalToolError(err *ToolError) string {

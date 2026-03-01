@@ -3,23 +3,26 @@ package core
 import "strings"
 
 type ToolError struct {
-	Code    string `json:"code"`
-	Message string `json:"message"`
+	ErrorString   string `json:"errorString"`
+	SuggestString string `json:"suggestString"`
 }
 
 func (e *ToolError) Error() string {
 	if e == nil {
 		return ""
 	}
-	if strings.TrimSpace(e.Code) == "" {
-		return strings.TrimSpace(e.Message)
+	if strings.TrimSpace(e.ErrorString) == "" {
+		return strings.TrimSpace(e.SuggestString)
 	}
-	if strings.TrimSpace(e.Message) == "" {
-		return strings.TrimSpace(e.Code)
+	if strings.TrimSpace(e.SuggestString) == "" {
+		return strings.TrimSpace(e.ErrorString)
 	}
-	return strings.TrimSpace(e.Code) + ": " + strings.TrimSpace(e.Message)
+	return strings.TrimSpace(e.ErrorString) + ": " + strings.TrimSpace(e.SuggestString)
 }
 
-func NewToolError(code, message string) *ToolError {
-	return &ToolError{Code: strings.TrimSpace(code), Message: strings.TrimSpace(message)}
+func NewToolError(errorString, suggestString string) *ToolError {
+	return &ToolError{
+		ErrorString:   strings.TrimSpace(errorString),
+		SuggestString: strings.TrimSpace(suggestString),
+	}
 }

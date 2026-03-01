@@ -24,9 +24,10 @@ type ToolCall struct {
 }
 
 type CreateResponseResult struct {
-	ID        string
-	FinalText string
-	ToolCalls []ToolCall
+	ID         string
+	FinalText  string
+	ToolCalls  []ToolCall
+	EventTrace []string
 }
 
 func (r CreateResponseResult) HasFinalText() bool {

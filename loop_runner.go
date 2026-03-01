@@ -301,7 +301,7 @@ func (r *LoopRunner) run(
 								"response_id": strings.TrimSpace(res.ID),
 								"tool_name":   strings.TrimSpace(call.Name),
 								"state":       "output-error",
-								"error_text":  toolErr.Message,
+								"error_text":  toolErr.ErrorString,
 								"output_len":  len(strings.TrimSpace(errOut)),
 								"output":      stringToMaybeJSONAny(errOut),
 							})
@@ -319,7 +319,7 @@ func (r *LoopRunner) run(
 									"response_id": strings.TrimSpace(res.ID),
 									"tool_name":   strings.TrimSpace(call.Name),
 									"state":       "output-error",
-									"error_text":  err.Message,
+									"error_text":  err.ErrorString,
 									"output_len":  len(strings.TrimSpace(errOut)),
 									"output":      stringToMaybeJSONAny(errOut),
 								})
@@ -351,7 +351,7 @@ func (r *LoopRunner) run(
 								"response_id": strings.TrimSpace(res.ID),
 								"tool_name":   strings.TrimSpace(call.Name),
 								"state":       "output-error",
-								"error_text":  err.Message,
+								"error_text":  err.ErrorString,
 								"output_len":  len(strings.TrimSpace(errOut)),
 								"output":      stringToMaybeJSONAny(errOut),
 							})
