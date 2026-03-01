@@ -13,6 +13,7 @@ const (
 	LoopEventTypeToolOutput       = "tool_output"
 	LoopEventTypeRoundtripPrepare = "roundtrip_prepared"
 	LoopEventTypeContextRewrite   = "context_rewrite"
+	LoopEventTypeTransition       = "runner_transition"
 )
 
 type ModelRequestEvent struct {
@@ -87,3 +88,9 @@ type ContextRewriteEvent struct {
 }
 
 func (ContextRewriteEvent) LoopEventType() string { return LoopEventTypeContextRewrite }
+
+type TransitionEvent struct {
+	Record TransitionRecord
+}
+
+func (TransitionEvent) LoopEventType() string { return LoopEventTypeTransition }
