@@ -15,12 +15,15 @@ import (
 )
 
 type OpenAIConfig struct {
-	BaseURL         string
-	Model           string
-	APIKey          string
-	ReasoningEffort string
-	UseResponsesAPI bool
-	EnableState     bool
+	BaseURL          string
+	Model            string
+	APIKey           string
+	ReasoningEffort  string
+	UseResponsesAPI  bool
+	EnableState      bool
+	AuthProvider     AuthProvider
+	EndpointProvider EndpointProvider
+	RequestMutator   RequestMutator
 }
 
 type ResponsesClient struct {
@@ -32,6 +35,7 @@ func NewResponsesClient(cfg OpenAIConfig, httpClient *http.Client) *ResponsesCli
 	if httpClient == nil {
 		httpClient = http.DefaultClient
 	}
+	httpClient = wrapHTTPClientWithMutator(httpClient, cfg.RequestMutator)
 	opts := []option.RequestOption{option.WithHTTPClient(httpClient)}
 	if base := strings.TrimSpace(cfg.BaseURL); base != "" {
 		opts = append(opts, option.WithBaseURL(base))
@@ -66,6 +70,10 @@ func (c *ResponsesClient) CreateResponse(ctx context.Context, req core.CreateRes
 	if c.cfg.EnableState {
 		requestOpts = append(requestOpts, option.WithJSONSet("state", true))
 	}
+	requestOpts, err = c.requestOptions(ctx, requestOpts)
+	if err != nil {
+		return nil, err
+	}
 	_, err = c.service.New(ctx, params, requestOpts...)
 	if err != nil {
 		return nil, c.wrapRequestError(err, req, rawResp)
@@ -92,6 +100,10 @@ func (c *ResponsesClient) CreateResponseStream(ctx context.Context, req core.Cre
 	requestOpts := []option.RequestOption{option.WithResponseInto(&rawResp)}
 	if c.cfg.EnableState {
 		requestOpts = append(requestOpts, option.WithJSONSet("state", true))
+	}
+	requestOpts, err = c.requestOptions(ctx, requestOpts)
+	if err != nil {
+		return nil, err
 	}
 	stream := c.service.NewStreaming(ctx, params, requestOpts...)
 	if stream == nil {
@@ -391,6 +403,72 @@ func (c *ResponsesClient) toSDKRequest(req core.CreateResponseRequest) (response
 		out.Tools = tools
 	}
 	return out, nil
+}
+
+func (c *ResponsesClient) requestOptions(ctx context.Context, opts []option.RequestOption) ([]option.RequestOption, error) {
+	out := make([]option.RequestOption, 0, len(opts)+2)
+	out = append(out, opts...)
+	if c != nil && c.cfg.EndpointProvider != nil {
+		baseURL, err := c.cfg.EndpointProvider.ResolveEndpoint(ctx)
+		if err != nil {
+			return nil, err
+		}
+		baseURL = strings.TrimSpace(baseURL)
+		if baseURL != "" {
+			out = append(out, option.WithBaseURL(baseURL))
+		}
+	}
+	if c != nil && c.cfg.AuthProvider != nil {
+		cred, err := c.cfg.AuthProvider.ResolveAuth(ctx)
+		if err != nil {
+			return nil, err
+		}
+		headerName := strings.TrimSpace(cred.HeaderName)
+		headerValue := strings.TrimSpace(cred.HeaderValue)
+		if headerName == "" {
+			headerName = "Authorization"
+		}
+		if headerValue != "" {
+			out = append(out, option.WithHeader(headerName, headerValue))
+		}
+	}
+	return out, nil
+}
+
+type requestMutatingRoundTripper struct {
+	base    http.RoundTripper
+	mutator RequestMutator
+}
+
+func (rt requestMutatingRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req == nil {
+		return rt.base.RoundTrip(req)
+	}
+	if rt.mutator != nil {
+		if err := rt.mutator.MutateRequest(req.Context(), req); err != nil {
+			return nil, err
+		}
+	}
+	return rt.base.RoundTrip(req)
+}
+
+func wrapHTTPClientWithMutator(base *http.Client, mutator RequestMutator) *http.Client {
+	if base == nil {
+		base = http.DefaultClient
+	}
+	if mutator == nil {
+		return base
+	}
+	clone := *base
+	transport := clone.Transport
+	if transport == nil {
+		transport = http.DefaultTransport
+	}
+	clone.Transport = requestMutatingRoundTripper{
+		base:    transport,
+		mutator: mutator,
+	}
+	return &clone
 }
 
 func toSDKInput(input core.ResponseInput) (responses.ResponseNewParamsInputUnion, error) {
