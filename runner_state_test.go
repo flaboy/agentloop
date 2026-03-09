@@ -114,6 +114,25 @@ func TestLoopRunner_RunWithContextResultReturnsFinalResponseID(t *testing.T) {
 	}
 }
 
+func TestLoopRunner_RunStreamWithContextResultReturnsFinalResponseID(t *testing.T) {
+	client := &hookTestClient{responses: []core.CreateResponseResult{{ID: "resp-final-stream-1", FinalText: "done"}}}
+	runner := NewLoopRunner(client, nil, LoopRunnerOptions{MaxIterations: 2})
+
+	out, err := runner.RunStreamWithContextResult(context.Background(), ContextBuildRequest{
+		Inbound:     InboundMessage{Role: "user", Content: "hello"},
+		HistoryMode: HistoryModeLocalReplay,
+	}, nil)
+	if err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+	if out.FinalText != "done" {
+		t.Fatalf("unexpected output: %#v", out)
+	}
+	if out.FinalResponseID != "resp-final-stream-1" {
+		t.Fatalf("expected final response id, got %#v", out)
+	}
+}
+
 func TestLoopRunner_ProviderStateRoundtripUsesPreviousResponseIDInsteadOfReplayHistory(t *testing.T) {
 	client := &hookTestClient{responses: []core.CreateResponseResult{
 		{ID: "resp-1", ToolCalls: []core.ToolCall{{CallID: "call-1", Name: "echo", Arguments: "{}"}}},

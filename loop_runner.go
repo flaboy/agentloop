@@ -120,11 +120,19 @@ func (r *LoopRunner) RunStreamWithContext(
 	req ContextBuildRequest,
 	onTextDelta func(string),
 ) (string, error) {
-	out, err := r.runWithContextRequest(ctx, req, onTextDelta, nil)
+	out, err := r.RunStreamWithContextResult(ctx, req, onTextDelta)
 	if err != nil {
 		return "", err
 	}
 	return out.FinalText, nil
+}
+
+func (r *LoopRunner) RunStreamWithContextResult(
+	ctx context.Context,
+	req ContextBuildRequest,
+	onTextDelta func(string),
+) (RunResult, error) {
+	return r.runWithContextRequest(ctx, req, onTextDelta, nil)
 }
 
 func (r *LoopRunner) RunStreamWithContextAndTools(
@@ -133,11 +141,20 @@ func (r *LoopRunner) RunStreamWithContextAndTools(
 	onTextDelta func(string),
 	onToolEvent func(LoopEvent),
 ) (string, error) {
-	out, err := r.runWithContextRequest(ctx, req, onTextDelta, onToolEvent)
+	out, err := r.RunStreamWithContextAndToolsResult(ctx, req, onTextDelta, onToolEvent)
 	if err != nil {
 		return "", err
 	}
 	return out.FinalText, nil
+}
+
+func (r *LoopRunner) RunStreamWithContextAndToolsResult(
+	ctx context.Context,
+	req ContextBuildRequest,
+	onTextDelta func(string),
+	onToolEvent func(LoopEvent),
+) (RunResult, error) {
+	return r.runWithContextRequest(ctx, req, onTextDelta, onToolEvent)
 }
 
 func (r *LoopRunner) LastTransitions() []TransitionRecord {
