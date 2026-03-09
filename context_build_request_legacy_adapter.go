@@ -23,6 +23,7 @@ func BuildContextRequestFromPrompt(userPrompt string) (ContextBuildRequest, erro
 			Content: prompt,
 		},
 		SystemContextJSON: systemContext,
+		HistoryMode:       HistoryModeLocalReplay,
 	}, nil
 }
 

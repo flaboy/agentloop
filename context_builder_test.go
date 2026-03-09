@@ -43,3 +43,53 @@ func TestBuildContextRequestFromPrompt_LegacySystemContext(t *testing.T) {
 		t.Fatal("expected inbound content stripped of legacy system_context section")
 	}
 }
+
+func TestDefaultContextBuilder_HybridAutoFallsBackToLocalReplayWithoutPreviousResponseID(t *testing.T) {
+	builder := DefaultContextBuilder{}
+	store := true
+
+	result, err := builder.Build(ContextBuildRequest{
+		Inbound:             InboundMessage{Role: "user", Content: "current turn"},
+		SystemContextJSON:   `{"task_id":"t1"}`,
+		ConversationHistory: "[user#1] hello\n[assistant#2] hi",
+		HistoryMode:         HistoryModeHybridAuto,
+		Store:               &store,
+	})
+	if err != nil {
+		t.Fatalf("build failed: %v", err)
+	}
+	if result.Request.PreviousResponseID != "" {
+		t.Fatalf("expected empty previous_response_id, got %q", result.Request.PreviousResponseID)
+	}
+	if len(result.HistoryInputItems) != 3 {
+		t.Fatalf("expected system + history + user items, got %d", len(result.HistoryInputItems))
+	}
+	if result.HistoryInputItems[1].Role != "system" {
+		t.Fatalf("expected history block to be injected as system item, got %#v", result.HistoryInputItems[1])
+	}
+}
+
+func TestDefaultContextBuilder_HybridAutoUsesProviderStateWhenPreviousResponseIDExists(t *testing.T) {
+	builder := DefaultContextBuilder{}
+	store := true
+
+	result, err := builder.Build(ContextBuildRequest{
+		Inbound:            InboundMessage{Role: "user", Content: "next turn"},
+		SystemContextJSON:  `{"task_id":"t1"}`,
+		HistoryMode:        HistoryModeHybridAuto,
+		PreviousResponseID: "resp_prev_123",
+		Store:              &store,
+	})
+	if err != nil {
+		t.Fatalf("build failed: %v", err)
+	}
+	if result.Request.PreviousResponseID != "resp_prev_123" {
+		t.Fatalf("expected previous_response_id to be preserved, got %#v", result.Request)
+	}
+	if result.Request.Store == nil || !*result.Request.Store {
+		t.Fatalf("expected store=true to be preserved, got %#v", result.Request.Store)
+	}
+	if len(result.HistoryInputItems) != 2 {
+		t.Fatalf("expected system + current user only, got %d items", len(result.HistoryInputItems))
+	}
+}

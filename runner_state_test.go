@@ -93,3 +93,60 @@ func TestLoopRunner_EmitsContextRewriteEvent(t *testing.T) {
 		t.Fatal("expected context rewrite transition to be emitted")
 	}
 }
+
+func TestLoopRunner_RunWithContextResultReturnsFinalResponseID(t *testing.T) {
+	client := &hookTestClient{responses: []core.CreateResponseResult{{ID: "resp-final-1", FinalText: "done"}}}
+	runner := NewLoopRunner(client, nil, LoopRunnerOptions{MaxIterations: 2})
+
+	out, err := runner.RunWithContextResult(context.Background(), ContextBuildRequest{
+		Inbound:            InboundMessage{Role: "user", Content: "hello"},
+		HistoryMode:        HistoryModeProviderState,
+		PreviousResponseID: "resp-prev",
+	})
+	if err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+	if out.FinalText != "done" {
+		t.Fatalf("unexpected output: %#v", out)
+	}
+	if out.FinalResponseID != "resp-final-1" {
+		t.Fatalf("expected final response id, got %#v", out)
+	}
+}
+
+func TestLoopRunner_ProviderStateRoundtripUsesPreviousResponseIDInsteadOfReplayHistory(t *testing.T) {
+	client := &hookTestClient{responses: []core.CreateResponseResult{
+		{ID: "resp-1", ToolCalls: []core.ToolCall{{CallID: "call-1", Name: "echo", Arguments: "{}"}}},
+		{ID: "resp-2", FinalText: "done"},
+	}}
+	registry := core.NewToolRegistry[struct{}]()
+	if err := registry.Register(runnerStateTool{}); err != nil {
+		t.Fatalf("register tool failed: %v", err)
+	}
+	runner := NewLoopRunner(client, registry, LoopRunnerOptions{MaxIterations: 3})
+
+	out, err := runner.RunWithContextResult(context.Background(), ContextBuildRequest{
+		Inbound:            InboundMessage{Role: "user", Content: "hello"},
+		HistoryMode:        HistoryModeProviderState,
+		PreviousResponseID: "resp-bootstrap",
+	})
+	if err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+	if out.FinalResponseID != "resp-2" {
+		t.Fatalf("expected final response id resp-2, got %#v", out)
+	}
+	if len(client.requests) < 2 {
+		t.Fatalf("expected two model requests, got %d", len(client.requests))
+	}
+	second := client.requests[1]
+	if second.PreviousResponseID != "resp-1" {
+		t.Fatalf("expected second request to chain response id, got %#v", second)
+	}
+	if len(second.Input.Items) != 2 {
+		t.Fatalf("expected only tool replay items in provider-state roundtrip, got %#v", second.Input.Items)
+	}
+	if second.Input.Items[0].Type != "function_call" || second.Input.Items[1].Type != "function_call_output" {
+		t.Fatalf("expected function_call + function_call_output, got %#v", second.Input.Items)
+	}
+}

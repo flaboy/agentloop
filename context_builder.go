@@ -22,6 +22,9 @@ type ContextBuildRequest struct {
 	SystemContextJSON   string
 	EventContextJSON    string
 	ConversationHistory string
+	HistoryMode         HistoryMode
+	PreviousResponseID  string
+	Store               *bool
 	SystemEvents        []SystemEvent
 	ThreadContext       string
 	IsFirstTurn         bool
@@ -31,8 +34,9 @@ type ContextBuildRequest struct {
 }
 
 type ContextBuildResult struct {
-	Request           core.CreateResponseRequest
-	HistoryInputItems []core.ResponseInputItem
+	Request            core.CreateResponseRequest
+	HistoryInputItems  []core.ResponseInputItem
+	AppliedHistoryMode HistoryMode
 }
 
 type ContextBuilder interface {
@@ -55,13 +59,39 @@ func (b DefaultContextBuilder) Build(req ContextBuildRequest) (ContextBuildResul
 	if systemContextText != "" {
 		historyInputItems = append(historyInputItems, buildSystemMessageInputItem(systemContextText))
 	}
+	appliedMode := resolveHistoryMode(req)
+	if appliedMode == HistoryModeLocalReplay {
+		historyText := strings.TrimSpace(req.ConversationHistory)
+		if historyText != "" {
+			historyInputItems = append(historyInputItems, buildSystemMessageInputItem("[Conversation History]\n"+historyText))
+		}
+	}
 	historyInputItems = append(historyInputItems, buildRoleMessageInputItem(role, inboundContent))
 
 	request := core.CreateResponseRequest{
 		Input: core.NewResponseInputItems(cloneResponseInputItems(historyInputItems)),
+		Store: req.Store,
+	}
+	if appliedMode == HistoryModeProviderState {
+		request.PreviousResponseID = strings.TrimSpace(req.PreviousResponseID)
 	}
 	return ContextBuildResult{
-		Request:           request,
-		HistoryInputItems: historyInputItems,
+		Request:            request,
+		HistoryInputItems:  historyInputItems,
+		AppliedHistoryMode: appliedMode,
 	}, nil
+}
+
+func resolveHistoryMode(req ContextBuildRequest) HistoryMode {
+	mode := normalizeHistoryMode(req.HistoryMode)
+	if mode == HistoryModeHybridAuto {
+		if req.Store != nil && *req.Store && strings.TrimSpace(req.PreviousResponseID) != "" {
+			return HistoryModeProviderState
+		}
+		return HistoryModeLocalReplay
+	}
+	if mode == HistoryModeProviderState && strings.TrimSpace(req.PreviousResponseID) == "" {
+		return HistoryModeLocalReplay
+	}
+	return mode
 }

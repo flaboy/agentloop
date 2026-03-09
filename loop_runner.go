@@ -67,7 +67,11 @@ func (r *LoopRunner) Run(ctx context.Context, userPrompt string) (string, error)
 	if err != nil {
 		return "", err
 	}
-	return r.runWithContextRequest(ctx, req, nil, nil)
+	out, err := r.runWithContextRequest(ctx, req, nil, nil)
+	if err != nil {
+		return "", err
+	}
+	return out.FinalText, nil
 }
 
 func (r *LoopRunner) RunStream(ctx context.Context, userPrompt string, onTextDelta func(string)) (string, error) {
@@ -75,7 +79,11 @@ func (r *LoopRunner) RunStream(ctx context.Context, userPrompt string, onTextDel
 	if err != nil {
 		return "", err
 	}
-	return r.runWithContextRequest(ctx, req, onTextDelta, nil)
+	out, err := r.runWithContextRequest(ctx, req, onTextDelta, nil)
+	if err != nil {
+		return "", err
+	}
+	return out.FinalText, nil
 }
 
 func (r *LoopRunner) RunStreamWithTools(
@@ -88,10 +96,22 @@ func (r *LoopRunner) RunStreamWithTools(
 	if err != nil {
 		return "", err
 	}
-	return r.runWithContextRequest(ctx, req, onTextDelta, onToolEvent)
+	out, err := r.runWithContextRequest(ctx, req, onTextDelta, onToolEvent)
+	if err != nil {
+		return "", err
+	}
+	return out.FinalText, nil
 }
 
 func (r *LoopRunner) RunWithContext(ctx context.Context, req ContextBuildRequest) (string, error) {
+	out, err := r.runWithContextRequest(ctx, req, nil, nil)
+	if err != nil {
+		return "", err
+	}
+	return out.FinalText, nil
+}
+
+func (r *LoopRunner) RunWithContextResult(ctx context.Context, req ContextBuildRequest) (RunResult, error) {
 	return r.runWithContextRequest(ctx, req, nil, nil)
 }
 
@@ -100,7 +120,11 @@ func (r *LoopRunner) RunStreamWithContext(
 	req ContextBuildRequest,
 	onTextDelta func(string),
 ) (string, error) {
-	return r.runWithContextRequest(ctx, req, onTextDelta, nil)
+	out, err := r.runWithContextRequest(ctx, req, onTextDelta, nil)
+	if err != nil {
+		return "", err
+	}
+	return out.FinalText, nil
 }
 
 func (r *LoopRunner) RunStreamWithContextAndTools(
@@ -109,7 +133,11 @@ func (r *LoopRunner) RunStreamWithContextAndTools(
 	onTextDelta func(string),
 	onToolEvent func(LoopEvent),
 ) (string, error) {
-	return r.runWithContextRequest(ctx, req, onTextDelta, onToolEvent)
+	out, err := r.runWithContextRequest(ctx, req, onTextDelta, onToolEvent)
+	if err != nil {
+		return "", err
+	}
+	return out.FinalText, nil
 }
 
 func (r *LoopRunner) LastTransitions() []TransitionRecord {
@@ -128,12 +156,12 @@ func (r *LoopRunner) runWithContextRequest(
 	contextReq ContextBuildRequest,
 	onTextDelta func(string),
 	onToolEvent func(LoopEvent),
-) (string, error) {
+) (RunResult, error) {
 	if r == nil || r.client == nil {
-		return "", errors.New("loop runner client is required")
+		return RunResult{}, errors.New("loop runner client is required")
 	}
 	if r.contextBuilder == nil {
-		return "", errors.New("context builder is required")
+		return RunResult{}, errors.New("context builder is required")
 	}
 
 	transitionRecords := make([]TransitionRecord, 0, 16)
@@ -163,11 +191,15 @@ func (r *LoopRunner) runWithContextRequest(
 	contextResult, buildErr := r.contextBuilder.Build(contextReq)
 	if buildErr != nil {
 		transition(RunnerEventRunFailed, RunnerStateFailed, 0, RunnerSnapshot{LastError: buildErr.Error()})
-		return "", fmt.Errorf("build initial context failed: %w", buildErr)
+		return RunResult{}, fmt.Errorf("build initial context failed: %w", buildErr)
+	}
+	appliedHistoryMode := contextResult.AppliedHistoryMode
+	if appliedHistoryMode == "" {
+		appliedHistoryMode = HistoryModeLocalReplay
 	}
 	transition(RunnerEventContextBuilt, RunnerStateCallingModel, 0, RunnerSnapshot{
 		RequestSummary: summarizeCreateResponseRequest(contextResult.Request),
-		RoundtripMode:  roundtripModeName(true),
+		RoundtripMode:  roundtripModeName(appliedHistoryMode != HistoryModeProviderState),
 	})
 	req := contextResult.Request
 	historyInputItems := cloneResponseInputItems(contextResult.HistoryInputItems)
@@ -177,7 +209,7 @@ func (r *LoopRunner) runWithContextRequest(
 		iteration := i + 1
 		transition(RunnerEventModelRequest, RunnerStateCallingModel, iteration, RunnerSnapshot{
 			RequestSummary: summarizeCreateResponseRequest(req),
-			RoundtripMode:  roundtripModeName(true),
+			RoundtripMode:  roundtripModeName(appliedHistoryMode != HistoryModeProviderState),
 		})
 		callReq := req
 		if err := core.ValidateResponseInputInvariants(callReq.Input); err != nil {
@@ -186,7 +218,7 @@ func (r *LoopRunner) runWithContextRequest(
 				RequestSummary: summarizeCreateResponseRequest(callReq),
 				LastError:      err.Error(),
 			})
-			return "", fmt.Errorf("%s: %w", base, err)
+			return RunResult{}, fmt.Errorf("%s: %w", base, err)
 		}
 		reqSummary := summarizeCreateResponseRequest(callReq)
 		r.emitLoopEvent(onToolEvent, ModelRequestEvent{
@@ -194,7 +226,7 @@ func (r *LoopRunner) runWithContextRequest(
 			Timestamp:        time.Now(),
 			Request:          reqSummary,
 			PreviousResponse: lastResponseTrace,
-			RoundtripMode:    roundtripModeName(true),
+			RoundtripMode:    roundtripModeName(appliedHistoryMode != HistoryModeProviderState),
 		})
 
 		callCtx := ctx
@@ -239,14 +271,14 @@ func (r *LoopRunner) runWithContextRequest(
 				RequestSummary: reqSummary,
 				LastError:      err.Error(),
 			})
-			return "", fmt.Errorf("%s: %w", base, err)
+			return RunResult{}, fmt.Errorf("%s: %w", base, err)
 		}
 		if res == nil {
 			transition(RunnerEventRunFailed, RunnerStateFailed, iteration, RunnerSnapshot{
 				RequestSummary: reqSummary,
 				LastError:      "nil model response",
 			})
-			return "", fmt.Errorf("responses request returned nil response iteration=%d %s", iteration, reqSummary)
+			return RunResult{}, fmt.Errorf("responses request returned nil response iteration=%d %s", iteration, reqSummary)
 		}
 
 		currentTrace := summarizeEventTrace(res.EventTrace)
@@ -254,7 +286,7 @@ func (r *LoopRunner) runWithContextRequest(
 			RequestSummary: reqSummary,
 			ResponseID:     strings.TrimSpace(res.ID),
 			ToolCalls:      len(res.ToolCalls),
-			RoundtripMode:  roundtripModeName(true),
+			RoundtripMode:  roundtripModeName(appliedHistoryMode != HistoryModeProviderState),
 		})
 		r.emitLoopEvent(onToolEvent, ModelResponseEvent{
 			Iteration:        iteration,
@@ -273,9 +305,13 @@ func (r *LoopRunner) runWithContextRequest(
 				RequestSummary: reqSummary,
 				ResponseID:     strings.TrimSpace(res.ID),
 				ToolCalls:      len(res.ToolCalls),
-				RoundtripMode:  roundtripModeName(true),
+				RoundtripMode:  roundtripModeName(appliedHistoryMode != HistoryModeProviderState),
 			})
-			return res.FinalText, nil
+			return RunResult{
+				FinalText:          res.FinalText,
+				FinalResponseID:    strings.TrimSpace(res.ID),
+				AppliedHistoryMode: appliedHistoryMode,
+			}, nil
 		}
 		if len(res.ToolCalls) == 0 {
 			transition(RunnerEventRunFailed, RunnerStateFailed, iteration, RunnerSnapshot{
@@ -283,7 +319,7 @@ func (r *LoopRunner) runWithContextRequest(
 				ResponseID:     strings.TrimSpace(res.ID),
 				LastError:      "model response has no final text and no tool calls",
 			})
-			return "", fmt.Errorf(
+			return RunResult{}, fmt.Errorf(
 				"responses api returned no output_text and no tool_calls iteration=%d response_id=%q %s response_trace=%s",
 				iteration,
 				strings.TrimSpace(res.ID),
@@ -302,7 +338,7 @@ func (r *LoopRunner) runWithContextRequest(
 					ResponseID:     strings.TrimSpace(res.ID),
 					LastError:      "tool call missing call_id",
 				})
-				return "", fmt.Errorf(
+				return RunResult{}, fmt.Errorf(
 					"responses tool call missing call_id iteration=%d tool=%s id=%s response_id=%q %s",
 					iteration,
 					strings.TrimSpace(call.Name),
@@ -326,7 +362,7 @@ func (r *LoopRunner) runWithContextRequest(
 				RequestSummary: reqSummary,
 				ResponseID:     strings.TrimSpace(res.ID),
 				ToolCalls:      len(res.ToolCalls),
-				RoundtripMode:  roundtripModeName(true),
+				RoundtripMode:  roundtripModeName(appliedHistoryMode != HistoryModeProviderState),
 			})
 
 			out := ""
@@ -352,7 +388,7 @@ func (r *LoopRunner) runWithContextRequest(
 					ResponseID:     strings.TrimSpace(res.ID),
 					LastError:      hookErr.Error(),
 				})
-				return "", fmt.Errorf("tool hook failed iteration=%d call_id=%q tool=%q: %w", iteration, callID, strings.TrimSpace(call.Name), hookErr)
+				return RunResult{}, fmt.Errorf("tool hook failed iteration=%d call_id=%q tool=%q: %w", iteration, callID, strings.TrimSpace(call.Name), hookErr)
 			}
 			if toolHookCtx.ToolOutput != nil {
 				out = *toolHookCtx.ToolOutput
@@ -380,7 +416,7 @@ func (r *LoopRunner) runWithContextRequest(
 				RequestSummary: reqSummary,
 				ResponseID:     strings.TrimSpace(res.ID),
 				ToolCalls:      len(res.ToolCalls),
-				RoundtripMode:  roundtripModeName(true),
+				RoundtripMode:  roundtripModeName(appliedHistoryMode != HistoryModeProviderState),
 			})
 
 			replayCall := buildReplayFunctionCallInputItem(call)
@@ -393,7 +429,7 @@ func (r *LoopRunner) runWithContextRequest(
 			Iteration:          iteration,
 			Timestamp:          time.Now(),
 			PreviousResponseID: strings.TrimSpace(res.ID),
-			RoundtripMode:      roundtripModeName(true),
+			RoundtripMode:      roundtripModeName(appliedHistoryMode != HistoryModeProviderState),
 			ItemsCount:         len(outputs),
 			ItemsSummary:       summarizeResponseInput(core.NewResponseInputItems(outputs)),
 		})
@@ -401,7 +437,7 @@ func (r *LoopRunner) runWithContextRequest(
 			RequestSummary: reqSummary,
 			ResponseID:     strings.TrimSpace(res.ID),
 			ToolCalls:      len(res.ToolCalls),
-			RoundtripMode:  roundtripModeName(true),
+			RoundtripMode:  roundtripModeName(appliedHistoryMode != HistoryModeProviderState),
 		})
 		roundHookCtx := &HookContext{
 			Ctx:       ctx,
@@ -410,9 +446,24 @@ func (r *LoopRunner) runWithContextRequest(
 		}
 		previousInputSummary := summarizeResponseInput(req.Input)
 		err = r.runHookChain(HookPointRoundtrip, roundHookCtx, func() error {
-			historyInputItems = append(historyInputItems, replayItems...)
-			req = core.CreateResponseRequest{
-				Input: core.NewResponseInputItems(cloneResponseInputItems(historyInputItems)),
+			if appliedHistoryMode == HistoryModeProviderState {
+				req = core.CreateResponseRequest{
+					Model:              req.Model,
+					Input:              core.NewResponseInputItems(cloneResponseInputItems(replayItems)),
+					Tools:              req.Tools,
+					PreviousResponseID: strings.TrimSpace(res.ID),
+					Store:              req.Store,
+					Stream:             req.Stream,
+				}
+			} else {
+				historyInputItems = append(historyInputItems, replayItems...)
+				req = core.CreateResponseRequest{
+					Model:  req.Model,
+					Input:  core.NewResponseInputItems(cloneResponseInputItems(historyInputItems)),
+					Tools:  req.Tools,
+					Store:  req.Store,
+					Stream: req.Stream,
+				}
 			}
 			roundHookCtx.Request = &req
 			return nil
@@ -423,7 +474,7 @@ func (r *LoopRunner) runWithContextRequest(
 				ResponseID:     strings.TrimSpace(res.ID),
 				LastError:      err.Error(),
 			})
-			return "", fmt.Errorf("roundtrip hook failed iteration=%d: %w", iteration, err)
+			return RunResult{}, fmt.Errorf("roundtrip hook failed iteration=%d: %w", iteration, err)
 		}
 		if roundHookCtx.Request != nil {
 			req = *roundHookCtx.Request
@@ -434,9 +485,9 @@ func (r *LoopRunner) runWithContextRequest(
 			r.emitLoopEvent(onToolEvent, ContextRewriteEvent{
 				Iteration:           iteration,
 				Timestamp:           time.Now(),
-				ClearReasons:        []string{"roundtrip_replay_items_appended"},
-				PreviousRoundMode:   roundtripModeName(true),
-				CurrentRoundMode:    roundtripModeName(true),
+				ClearReasons:        []string{"roundtrip_history_updated"},
+				PreviousRoundMode:   roundtripModeName(appliedHistoryMode != HistoryModeProviderState),
+				CurrentRoundMode:    roundtripModeName(appliedHistoryMode != HistoryModeProviderState),
 				InitialCurrentCmd:   "",
 				HistoryItemsUpdated: true,
 			})
@@ -444,21 +495,21 @@ func (r *LoopRunner) runWithContextRequest(
 				RequestSummary: summarizeCreateResponseRequest(req),
 				ResponseID:     strings.TrimSpace(res.ID),
 				ToolCalls:      len(res.ToolCalls),
-				RoundtripMode:  roundtripModeName(true),
+				RoundtripMode:  roundtripModeName(appliedHistoryMode != HistoryModeProviderState),
 			})
 		} else {
 			transition(RunnerEventContextRewritten, RunnerStateCallingModel, iteration, RunnerSnapshot{
 				RequestSummary: summarizeCreateResponseRequest(req),
 				ResponseID:     strings.TrimSpace(res.ID),
 				ToolCalls:      len(res.ToolCalls),
-				RoundtripMode:  roundtripModeName(true),
+				RoundtripMode:  roundtripModeName(appliedHistoryMode != HistoryModeProviderState),
 			})
 		}
 	}
 	transition(RunnerEventRunFailed, RunnerStateFailed, r.options.MaxIterations, RunnerSnapshot{
 		LastError: "responses loop exceeded max iterations",
 	})
-	return "", fmt.Errorf("responses loop exceeded max iterations: %d", r.options.MaxIterations)
+	return RunResult{}, fmt.Errorf("responses loop exceeded max iterations: %d", r.options.MaxIterations)
 }
 
 func (r *LoopRunner) executeToolCall(
