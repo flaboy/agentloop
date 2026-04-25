@@ -317,20 +317,20 @@ func (r *LoopRunner) runWithContextRequest(
 		})
 		lastResponseTrace = currentTrace
 
-		if res.HasFinalText() {
-			transition(RunnerEventRunCompleted, RunnerStateCompleted, iteration, RunnerSnapshot{
-				RequestSummary: reqSummary,
-				ResponseID:     strings.TrimSpace(res.ID),
-				ToolCalls:      len(res.ToolCalls),
-				RoundtripMode:  roundtripModeName(appliedHistoryMode != HistoryModeProviderState),
-			})
-			return RunResult{
-				FinalText:          res.FinalText,
-				FinalResponseID:    strings.TrimSpace(res.ID),
-				AppliedHistoryMode: appliedHistoryMode,
-			}, nil
-		}
 		if len(res.ToolCalls) == 0 {
+			if res.HasFinalText() {
+				transition(RunnerEventRunCompleted, RunnerStateCompleted, iteration, RunnerSnapshot{
+					RequestSummary: reqSummary,
+					ResponseID:     strings.TrimSpace(res.ID),
+					ToolCalls:      len(res.ToolCalls),
+					RoundtripMode:  roundtripModeName(appliedHistoryMode != HistoryModeProviderState),
+				})
+				return RunResult{
+					FinalText:          res.FinalText,
+					FinalResponseID:    strings.TrimSpace(res.ID),
+					AppliedHistoryMode: appliedHistoryMode,
+				}, nil
+			}
 			transition(RunnerEventRunFailed, RunnerStateFailed, iteration, RunnerSnapshot{
 				RequestSummary: reqSummary,
 				ResponseID:     strings.TrimSpace(res.ID),

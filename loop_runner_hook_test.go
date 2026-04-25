@@ -121,6 +121,51 @@ func TestLoopRunner_ToolHookCanRewriteToolOutput(t *testing.T) {
 	}
 }
 
+func TestLoopRunner_MixedResponseExecutesToolCallsBeforeCompleting(t *testing.T) {
+	client := &hookTestClient{responses: []core.CreateResponseResult{
+		{
+			ID:        "resp-1",
+			FinalText: "I'll read the skill document first.",
+			ToolCalls: []core.ToolCall{{
+				CallID:    "call-1",
+				Name:      "echo",
+				Arguments: "{}",
+			}},
+		},
+		{ID: "resp-2", FinalText: "done"},
+	}}
+	registry := core.NewToolRegistry[struct{}]()
+	if err := registry.Register(hookTestTool{}); err != nil {
+		t.Fatalf("register tool failed: %v", err)
+	}
+	runner := NewLoopRunner(client, registry, LoopRunnerOptions{MaxIterations: 3})
+
+	out, err := runner.Run(context.Background(), "test")
+	if err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+	if out != "done" {
+		t.Fatalf("unexpected output: %q", out)
+	}
+	if len(client.requests) < 2 {
+		t.Fatalf("expected at least 2 model requests, got %d", len(client.requests))
+	}
+	items := client.requests[1].Input.Items
+	if len(items) == 0 {
+		t.Fatalf("second request has no input items")
+	}
+	last := items[len(items)-1]
+	if last.Type != "function_call_output" {
+		t.Fatalf("expected last item function_call_output, got %q", last.Type)
+	}
+	if last.CallID != "call-1" {
+		t.Fatalf("unexpected call id: %q", last.CallID)
+	}
+	if last.Output != "tool-output" {
+		t.Fatalf("unexpected tool output: %q", last.Output)
+	}
+}
+
 func TestLoopRunner_HookMustCallNext(t *testing.T) {
 	client := &hookTestClient{responses: []core.CreateResponseResult{{FinalText: "hello"}}}
 	runner := NewLoopRunner(client, nil, LoopRunnerOptions{MaxIterations: 2})
