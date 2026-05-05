@@ -20,3 +20,12 @@ func TestValidateResponseInputInvariants_RejectsSystemNotFirst(t *testing.T) {
 		t.Fatal("expected system-order invariant error")
 	}
 }
+
+func TestValidateResponseInputInvariants_AllowsOutputWithoutLocalReplayCall(t *testing.T) {
+	err := ValidateResponseInputInvariants(NewResponseInputItems([]ResponseInputItem{
+		{Type: "function_call_output", CallID: "call-1", Output: `{"ok":true}`},
+	}))
+	if err != nil {
+		t.Fatalf("expected invariant to allow output-only roundtrip, got %v", err)
+	}
+}

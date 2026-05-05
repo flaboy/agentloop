@@ -12,8 +12,6 @@ func ValidateResponseInputInvariants(input ResponseInput) error {
 
 	systemCount := 0
 	systemIndex := -1
-	seenCallIDs := map[string]struct{}{}
-
 	for i, item := range input.Items {
 		itemType := strings.TrimSpace(item.Type)
 		role := strings.TrimSpace(item.Role)
@@ -23,20 +21,10 @@ func ValidateResponseInputInvariants(input ResponseInput) error {
 			systemIndex = i
 		}
 
-		if itemType == "function_call" {
-			callID := strings.TrimSpace(item.CallID)
-			if callID != "" {
-				seenCallIDs[callID] = struct{}{}
-			}
-		}
-
 		if itemType == "function_call_output" {
 			callID := strings.TrimSpace(item.CallID)
 			if callID == "" {
 				return fmt.Errorf("function_call_output missing call_id at index=%d", i)
-			}
-			if _, exists := seenCallIDs[callID]; !exists {
-				return fmt.Errorf("function_call_output without prior function_call call_id=%q index=%d", callID, i)
 			}
 		}
 	}

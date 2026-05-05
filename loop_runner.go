@@ -30,6 +30,7 @@ type LoopRunner struct {
 	tools          *core.ToolRegistry[struct{}]
 	options        LoopRunnerOptions
 	contextBuilder ContextBuilder
+	compaction     CompactionDelegate
 	eventBus       *LoopEventBus
 	hooksMu        sync.RWMutex
 	hooks          map[HookPoint][]HookFunc
@@ -38,9 +39,6 @@ type LoopRunner struct {
 }
 
 func NewLoopRunner(client ResponsesAPI, tools *core.ToolRegistry[struct{}], options LoopRunnerOptions) *LoopRunner {
-	if options.MaxIterations <= 0 {
-		options.MaxIterations = 8
-	}
 	builder := options.ContextBuilder
 	if builder == nil {
 		builder = DefaultContextBuilder{}
@@ -60,6 +58,13 @@ func (r *LoopRunner) EventBus() *LoopEventBus {
 		return nil
 	}
 	return r.eventBus
+}
+
+func (r *LoopRunner) RegisterCompactionDelegate(fn CompactionDelegate) {
+	if r == nil {
+		return
+	}
+	r.compaction = fn
 }
 
 func (r *LoopRunner) Run(ctx context.Context, userPrompt string) (string, error) {
@@ -221,8 +226,8 @@ func (r *LoopRunner) runWithContextRequest(
 	req := contextResult.Request
 	historyInputItems := cloneResponseInputItems(contextResult.HistoryInputItems)
 	lastResponseTrace := ""
-
-	for i := 0; i < r.options.MaxIterations; i++ {
+	unbounded := r.options.MaxIterations <= 0
+	for i := 0; unbounded || i < r.options.MaxIterations; i++ {
 		iteration := i + 1
 		transition(RunnerEventModelRequest, RunnerStateCallingModel, iteration, RunnerSnapshot{
 			RequestSummary: summarizeCreateResponseRequest(req),
@@ -317,20 +322,20 @@ func (r *LoopRunner) runWithContextRequest(
 		})
 		lastResponseTrace = currentTrace
 
+		if len(res.ToolCalls) == 0 && res.HasFinalText() {
+			transition(RunnerEventRunCompleted, RunnerStateCompleted, iteration, RunnerSnapshot{
+				RequestSummary: reqSummary,
+				ResponseID:     strings.TrimSpace(res.ID),
+				ToolCalls:      len(res.ToolCalls),
+				RoundtripMode:  roundtripModeName(appliedHistoryMode != HistoryModeProviderState),
+			})
+			return RunResult{
+				FinalText:          res.FinalText,
+				FinalResponseID:    strings.TrimSpace(res.ID),
+				AppliedHistoryMode: appliedHistoryMode,
+			}, nil
+		}
 		if len(res.ToolCalls) == 0 {
-			if res.HasFinalText() {
-				transition(RunnerEventRunCompleted, RunnerStateCompleted, iteration, RunnerSnapshot{
-					RequestSummary: reqSummary,
-					ResponseID:     strings.TrimSpace(res.ID),
-					ToolCalls:      len(res.ToolCalls),
-					RoundtripMode:  roundtripModeName(appliedHistoryMode != HistoryModeProviderState),
-				})
-				return RunResult{
-					FinalText:          res.FinalText,
-					FinalResponseID:    strings.TrimSpace(res.ID),
-					AppliedHistoryMode: appliedHistoryMode,
-				}, nil
-			}
 			transition(RunnerEventRunFailed, RunnerStateFailed, iteration, RunnerSnapshot{
 				RequestSummary: reqSummary,
 				ResponseID:     strings.TrimSpace(res.ID),
@@ -441,6 +446,31 @@ func (r *LoopRunner) runWithContextRequest(
 			outputs = append(outputs, outputItem)
 			replayItems = append(replayItems, replayCall, outputItem)
 		}
+		if shouldShortCircuitFunctionCallOutputs(outputs) {
+			transition(RunnerEventRoundtripPrepared, RunnerStatePreparingRoundtrip, iteration, RunnerSnapshot{
+				RequestSummary: reqSummary,
+				ResponseID:     strings.TrimSpace(res.ID),
+				ToolCalls:      len(res.ToolCalls),
+				RoundtripMode:  roundtripModeName(appliedHistoryMode != HistoryModeProviderState),
+			})
+			transition(RunnerEventContextRewritten, RunnerStateCallingModel, iteration, RunnerSnapshot{
+				RequestSummary: reqSummary,
+				ResponseID:     strings.TrimSpace(res.ID),
+				ToolCalls:      len(res.ToolCalls),
+				RoundtripMode:  roundtripModeName(appliedHistoryMode != HistoryModeProviderState),
+			})
+			transition(RunnerEventRunCompleted, RunnerStateCompleted, iteration, RunnerSnapshot{
+				RequestSummary: reqSummary,
+				ResponseID:     strings.TrimSpace(res.ID),
+				ToolCalls:      len(res.ToolCalls),
+				RoundtripMode:  roundtripModeName(appliedHistoryMode != HistoryModeProviderState),
+			})
+			return RunResult{
+				FinalText:          "",
+				FinalResponseID:    strings.TrimSpace(res.ID),
+				AppliedHistoryMode: appliedHistoryMode,
+			}, nil
+		}
 
 		r.emitLoopEvent(onToolEvent, RoundtripPreparedEvent{
 			Iteration:          iteration,
@@ -466,7 +496,7 @@ func (r *LoopRunner) runWithContextRequest(
 			if appliedHistoryMode == HistoryModeProviderState {
 				req = core.CreateResponseRequest{
 					Model:              req.Model,
-					Input:              core.NewResponseInputItems(cloneResponseInputItems(replayItems)),
+					Input:              core.NewResponseInputItems(cloneResponseInputItems(outputs)),
 					Tools:              req.Tools,
 					PreviousResponseID: strings.TrimSpace(res.ID),
 					Store:              req.Store,
@@ -480,6 +510,47 @@ func (r *LoopRunner) runWithContextRequest(
 					Tools:  req.Tools,
 					Store:  req.Store,
 					Stream: req.Stream,
+				}
+			}
+			if r.compaction != nil {
+				out, compactionErr := r.compaction(CompactionDelegateInput{
+					Iteration:              iteration,
+					OriginalContextRequest: contextReq,
+					CurrentRequest:         req,
+					Response:               *res,
+					ReplayItems:            cloneResponseInputItems(replayItems),
+					AppliedHistoryMode:     appliedHistoryMode,
+					PreviousResponseID:     strings.TrimSpace(res.ID),
+				})
+				if compactionErr != nil {
+					return fmt.Errorf("compaction delegate failed iteration=%d: %w", iteration, compactionErr)
+				}
+				if out.NeedCompaction {
+					if out.RewriteRequest == nil {
+						return fmt.Errorf("compaction delegate missing rewrite request iteration=%d", iteration)
+					}
+					rewriteReq := *out.RewriteRequest
+					if out.ForceHistoryMode != "" {
+						rewriteReq.HistoryMode = out.ForceHistoryMode
+						if rewriteReq.PrebuiltRequest != nil {
+							rewriteReq.PrebuiltAppliedHistoryMode = out.ForceHistoryMode
+						}
+					}
+					if out.ResetPreviousResponse {
+						rewriteReq.PreviousResponseID = ""
+						if rewriteReq.PrebuiltRequest != nil {
+							rewrite := *rewriteReq.PrebuiltRequest
+							rewrite.PreviousResponseID = ""
+							rewriteReq.PrebuiltRequest = &rewrite
+						}
+					}
+					rewritten, rewriteErr := r.contextBuilder.Build(rewriteReq)
+					if rewriteErr != nil {
+						return fmt.Errorf("build compacted context failed iteration=%d: %w", iteration, rewriteErr)
+					}
+					req = rewritten.Request
+					historyInputItems = cloneResponseInputItems(rewritten.HistoryInputItems)
+					appliedHistoryMode = rewritten.AppliedHistoryMode
 				}
 			}
 			roundHookCtx.Request = &req
@@ -643,7 +714,12 @@ func cloneResponseInputItems(in []core.ResponseInputItem) []core.ResponseInputIt
 		return []core.ResponseInputItem{}
 	}
 	out := make([]core.ResponseInputItem, len(in))
-	copy(out, in)
+	for i, item := range in {
+		out[i] = item
+		if len(item.Content) > 0 {
+			out[i].Content = append([]core.ResponseInputContentPart(nil), item.Content...)
+		}
+	}
 	return out
 }
 
@@ -687,6 +763,23 @@ func buildReplayFunctionCallInputItem(call core.ToolCall) core.ResponseInputItem
 		Name:      sanitizeFunctionCallNameForInput(call.Name),
 		Arguments: arguments,
 	}
+}
+
+func shouldShortCircuitFunctionCallOutputs(items []core.ResponseInputItem) bool {
+	for _, item := range items {
+		if strings.TrimSpace(item.Type) != "function_call_output" {
+			continue
+		}
+		var payload map[string]any
+		if err := json.Unmarshal([]byte(strings.TrimSpace(item.Output)), &payload); err != nil {
+			continue
+		}
+		flag, _ := payload["__octopus_terminal_ui_action"].(bool)
+		if flag {
+			return true
+		}
+	}
+	return false
 }
 
 func sanitizeFunctionCallNameForInput(name string) string {

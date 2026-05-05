@@ -162,10 +162,50 @@ func TestLoopRunner_ProviderStateRoundtripUsesPreviousResponseIDInsteadOfReplayH
 	if second.PreviousResponseID != "resp-1" {
 		t.Fatalf("expected second request to chain response id, got %#v", second)
 	}
-	if len(second.Input.Items) != 2 {
-		t.Fatalf("expected only tool replay items in provider-state roundtrip, got %#v", second.Input.Items)
+	if len(second.Input.Items) != 1 {
+		t.Fatalf("expected only function_call_output in provider-state roundtrip, got %#v", second.Input.Items)
 	}
-	if second.Input.Items[0].Type != "function_call" || second.Input.Items[1].Type != "function_call_output" {
-		t.Fatalf("expected function_call + function_call_output, got %#v", second.Input.Items)
+	if second.Input.Items[0].Type != "function_call_output" {
+		t.Fatalf("expected function_call_output, got %#v", second.Input.Items)
+	}
+}
+
+func TestLoopRunner_MixedFinalTextAndToolCallsExecutesTools(t *testing.T) {
+	client := &hookTestClient{responses: []core.CreateResponseResult{
+		{
+			ID:        "resp-1",
+			FinalText: "premature text",
+			ToolCalls: []core.ToolCall{{CallID: "call-1", Name: "echo", Arguments: "{}"}},
+		},
+		{ID: "resp-2", FinalText: "done"},
+	}}
+	registry := core.NewToolRegistry[struct{}]()
+	if err := registry.Register(runnerStateTool{}); err != nil {
+		t.Fatalf("register tool failed: %v", err)
+	}
+	runner := NewLoopRunner(client, registry, LoopRunnerOptions{MaxIterations: 3})
+
+	out, err := runner.RunWithContext(context.Background(), ContextBuildRequest{
+		Inbound: InboundMessage{Role: "user", Content: "hello"},
+	})
+	if err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+	if out != "done" {
+		t.Fatalf("unexpected output: %q", out)
+	}
+	if len(client.requests) != 2 {
+		t.Fatalf("expected tool roundtrip to trigger second request, got %d requests", len(client.requests))
+	}
+	second := client.requests[1]
+	if len(second.Input.Items) != 3 {
+		t.Fatalf("expected replayed history plus tool output, got %#v", second.Input.Items)
+	}
+	last := second.Input.Items[len(second.Input.Items)-1]
+	if last.Type != "function_call_output" {
+		t.Fatalf("expected function_call_output replay, got %#v", last)
+	}
+	if last.Output != `{"ok":true}` {
+		t.Fatalf("unexpected tool output replay: %#v", last)
 	}
 }
