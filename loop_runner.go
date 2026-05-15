@@ -31,6 +31,7 @@ type LoopRunner struct {
 	options        LoopRunnerOptions
 	contextBuilder ContextBuilder
 	compaction     CompactionDelegate
+	steer          SteerDelegate
 	eventBus       *LoopEventBus
 	hooksMu        sync.RWMutex
 	hooks          map[HookPoint][]HookFunc
@@ -65,6 +66,13 @@ func (r *LoopRunner) RegisterCompactionDelegate(fn CompactionDelegate) {
 		return
 	}
 	r.compaction = fn
+}
+
+func (r *LoopRunner) RegisterSteerDelegate(fn SteerDelegate) {
+	if r == nil {
+		return
+	}
+	r.steer = fn
 }
 
 func (r *LoopRunner) Run(ctx context.Context, userPrompt string) (string, error) {
@@ -234,6 +242,36 @@ func (r *LoopRunner) runWithContextRequest(
 			RoundtripMode:  roundtripModeName(appliedHistoryMode != HistoryModeProviderState),
 		})
 		callReq := req
+		steerReq, steerHistoryItems, steerMode, steerChanged, steerStopped, steerStopReason, steerErr := r.applySteer(ctx, SteerDelegateInput{
+			Iteration:              iteration,
+			OriginalContextRequest: contextReq,
+			CurrentRequest:         callReq,
+			AppliedHistoryMode:     appliedHistoryMode,
+			Boundary:               SteerBoundaryBeforeModelCall,
+		}, historyInputItems)
+		if steerErr != nil {
+			transition(RunnerEventRunFailed, RunnerStateFailed, iteration, RunnerSnapshot{
+				RequestSummary: summarizeCreateResponseRequest(callReq),
+				LastError:      steerErr.Error(),
+			})
+			return RunResult{}, fmt.Errorf("steer delegate failed boundary=%s iteration=%d: %w", SteerBoundaryBeforeModelCall, iteration, steerErr)
+		}
+		if steerStopped {
+			transition(RunnerEventRunCompleted, RunnerStateCompleted, iteration, RunnerSnapshot{
+				RequestSummary: summarizeCreateResponseRequest(callReq),
+				RoundtripMode:  roundtripModeName(appliedHistoryMode != HistoryModeProviderState),
+			})
+			return RunResult{
+				AppliedHistoryMode: appliedHistoryMode,
+				StopReason:         steerStopReason,
+			}, nil
+		}
+		if steerChanged {
+			req = steerReq
+			callReq = steerReq
+			historyInputItems = steerHistoryItems
+			appliedHistoryMode = steerMode
+		}
 		if err := core.ValidateResponseInputInvariants(callReq.Input); err != nil {
 			base := fmt.Sprintf("responses input invariant failed iteration=%d %s", iteration, summarizeCreateResponseRequest(callReq))
 			transition(RunnerEventRunFailed, RunnerStateFailed, iteration, RunnerSnapshot{
@@ -323,6 +361,53 @@ func (r *LoopRunner) runWithContextRequest(
 		lastResponseTrace = currentTrace
 
 		if len(res.ToolCalls) == 0 && res.HasFinalText() {
+			steerReq, steerHistoryItems, steerMode, steerChanged, steerStopped, steerStopReason, steerErr := r.applySteer(ctx, SteerDelegateInput{
+				Iteration:              iteration,
+				OriginalContextRequest: contextReq,
+				CurrentRequest:         req,
+				Response:               res,
+				AppliedHistoryMode:     appliedHistoryMode,
+				Boundary:               SteerBoundaryAfterModelResponseBeforeFinal,
+			}, historyInputItems)
+			if steerErr != nil {
+				transition(RunnerEventRunFailed, RunnerStateFailed, iteration, RunnerSnapshot{
+					RequestSummary: reqSummary,
+					ResponseID:     strings.TrimSpace(res.ID),
+					LastError:      steerErr.Error(),
+				})
+				return RunResult{}, fmt.Errorf("steer delegate failed boundary=%s iteration=%d: %w", SteerBoundaryAfterModelResponseBeforeFinal, iteration, steerErr)
+			}
+			if steerStopped {
+				transition(RunnerEventRunCompleted, RunnerStateCompleted, iteration, RunnerSnapshot{
+					RequestSummary: reqSummary,
+					ResponseID:     strings.TrimSpace(res.ID),
+					ToolCalls:      len(res.ToolCalls),
+					RoundtripMode:  roundtripModeName(appliedHistoryMode != HistoryModeProviderState),
+				})
+				return RunResult{
+					FinalResponseID:    strings.TrimSpace(res.ID),
+					AppliedHistoryMode: appliedHistoryMode,
+					StopReason:         steerStopReason,
+				}, nil
+			}
+			if steerChanged {
+				req = steerReq
+				historyInputItems = steerHistoryItems
+				appliedHistoryMode = steerMode
+				transition(RunnerEventRoundtripPrepared, RunnerStatePreparingRoundtrip, iteration, RunnerSnapshot{
+					RequestSummary: reqSummary,
+					ResponseID:     strings.TrimSpace(res.ID),
+					ToolCalls:      len(res.ToolCalls),
+					RoundtripMode:  roundtripModeName(appliedHistoryMode != HistoryModeProviderState),
+				})
+				transition(RunnerEventContextRewritten, RunnerStateCallingModel, iteration, RunnerSnapshot{
+					RequestSummary: summarizeCreateResponseRequest(req),
+					ResponseID:     strings.TrimSpace(res.ID),
+					ToolCalls:      len(res.ToolCalls),
+					RoundtripMode:  roundtripModeName(appliedHistoryMode != HistoryModeProviderState),
+				})
+				continue
+			}
 			transition(RunnerEventRunCompleted, RunnerStateCompleted, iteration, RunnerSnapshot{
 				RequestSummary: reqSummary,
 				ResponseID:     strings.TrimSpace(res.ID),
@@ -492,6 +577,8 @@ func (r *LoopRunner) runWithContextRequest(
 			Response:  res,
 		}
 		previousInputSummary := summarizeResponseInput(req.Input)
+		roundtripStopped := false
+		roundtripStopReason := ""
 		err = r.runHookChain(HookPointRoundtrip, roundHookCtx, func() error {
 			if appliedHistoryMode == HistoryModeProviderState {
 				req = core.CreateResponseRequest{
@@ -553,6 +640,25 @@ func (r *LoopRunner) runWithContextRequest(
 					appliedHistoryMode = rewritten.AppliedHistoryMode
 				}
 			}
+			steerReq, steerHistoryItems, steerMode, steerChanged, steerStopped, steerStopReason, steerErr := r.applySteer(ctx, SteerDelegateInput{
+				Iteration:              iteration,
+				OriginalContextRequest: contextReq,
+				CurrentRequest:         req,
+				Response:               res,
+				AppliedHistoryMode:     appliedHistoryMode,
+				Boundary:               SteerBoundaryAfterToolRoundtrip,
+			}, historyInputItems)
+			if steerErr != nil {
+				return fmt.Errorf("steer delegate failed boundary=%s iteration=%d: %w", SteerBoundaryAfterToolRoundtrip, iteration, steerErr)
+			}
+			if steerStopped {
+				roundtripStopped = true
+				roundtripStopReason = steerStopReason
+			} else if steerChanged {
+				req = steerReq
+				historyInputItems = steerHistoryItems
+				appliedHistoryMode = steerMode
+			}
 			roundHookCtx.Request = &req
 			return nil
 		})
@@ -566,6 +672,25 @@ func (r *LoopRunner) runWithContextRequest(
 		}
 		if roundHookCtx.Request != nil {
 			req = *roundHookCtx.Request
+		}
+		if roundtripStopped {
+			transition(RunnerEventContextRewritten, RunnerStateCallingModel, iteration, RunnerSnapshot{
+				RequestSummary: summarizeCreateResponseRequest(req),
+				ResponseID:     strings.TrimSpace(res.ID),
+				ToolCalls:      len(res.ToolCalls),
+				RoundtripMode:  roundtripModeName(appliedHistoryMode != HistoryModeProviderState),
+			})
+			transition(RunnerEventRunCompleted, RunnerStateCompleted, iteration, RunnerSnapshot{
+				RequestSummary: summarizeCreateResponseRequest(req),
+				ResponseID:     strings.TrimSpace(res.ID),
+				ToolCalls:      len(res.ToolCalls),
+				RoundtripMode:  roundtripModeName(appliedHistoryMode != HistoryModeProviderState),
+			})
+			return RunResult{
+				FinalResponseID:    strings.TrimSpace(res.ID),
+				AppliedHistoryMode: appliedHistoryMode,
+				StopReason:         roundtripStopReason,
+			}, nil
 		}
 		currentInputSummary := summarizeResponseInput(req.Input)
 		historyItemsUpdated := previousInputSummary != currentInputSummary
@@ -616,6 +741,49 @@ func (r *LoopRunner) executeToolCall(
 		return mustMarshalToolError(toolErr), toolErr.ErrorString, true
 	}
 	return toolOut, "", false
+}
+
+func (r *LoopRunner) applySteer(
+	ctx context.Context,
+	input SteerDelegateInput,
+	currentHistoryItems []core.ResponseInputItem,
+) (core.CreateResponseRequest, []core.ResponseInputItem, HistoryMode, bool, bool, string, error) {
+	if r == nil || r.steer == nil {
+		return input.CurrentRequest, currentHistoryItems, input.AppliedHistoryMode, false, false, "", nil
+	}
+	out, err := r.steer(ctx, input)
+	if err != nil {
+		return input.CurrentRequest, currentHistoryItems, input.AppliedHistoryMode, false, false, "", err
+	}
+	if out.Stop {
+		return input.CurrentRequest, currentHistoryItems, input.AppliedHistoryMode, false, true, strings.TrimSpace(out.Reason), nil
+	}
+	if out.RewriteRequest == nil {
+		return input.CurrentRequest, currentHistoryItems, input.AppliedHistoryMode, false, false, "", nil
+	}
+	rewritten, err := r.buildRewriteRequest(*out.RewriteRequest, out.ForceHistoryMode, out.ResetPreviousResponse)
+	if err != nil {
+		return input.CurrentRequest, currentHistoryItems, input.AppliedHistoryMode, false, false, "", err
+	}
+	return rewritten.Request, rewritten.HistoryInputItems, rewritten.AppliedHistoryMode, true, false, "", nil
+}
+
+func (r *LoopRunner) buildRewriteRequest(req ContextBuildRequest, forceMode HistoryMode, resetPreviousResponse bool) (ContextBuildResult, error) {
+	if forceMode != "" {
+		req.HistoryMode = forceMode
+		if req.PrebuiltRequest != nil {
+			req.PrebuiltAppliedHistoryMode = forceMode
+		}
+	}
+	if resetPreviousResponse {
+		req.PreviousResponseID = ""
+		if req.PrebuiltRequest != nil {
+			rewrite := *req.PrebuiltRequest
+			rewrite.PreviousResponseID = ""
+			req.PrebuiltRequest = &rewrite
+		}
+	}
+	return r.contextBuilder.Build(req)
 }
 
 func (r *LoopRunner) emitLoopEvent(onToolEvent func(LoopEvent), event LoopEvent) {
