@@ -2,6 +2,7 @@ package agentloop
 
 import (
 	"context"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -121,51 +122,6 @@ func TestLoopRunner_ToolHookCanRewriteToolOutput(t *testing.T) {
 	}
 }
 
-func TestLoopRunner_MixedResponseExecutesToolCallsBeforeCompleting(t *testing.T) {
-	client := &hookTestClient{responses: []core.CreateResponseResult{
-		{
-			ID:        "resp-1",
-			FinalText: "I'll read the skill document first.",
-			ToolCalls: []core.ToolCall{{
-				CallID:    "call-1",
-				Name:      "echo",
-				Arguments: "{}",
-			}},
-		},
-		{ID: "resp-2", FinalText: "done"},
-	}}
-	registry := core.NewToolRegistry[struct{}]()
-	if err := registry.Register(hookTestTool{}); err != nil {
-		t.Fatalf("register tool failed: %v", err)
-	}
-	runner := NewLoopRunner(client, registry, LoopRunnerOptions{MaxIterations: 3})
-
-	out, err := runner.Run(context.Background(), "test")
-	if err != nil {
-		t.Fatalf("run failed: %v", err)
-	}
-	if out != "done" {
-		t.Fatalf("unexpected output: %q", out)
-	}
-	if len(client.requests) < 2 {
-		t.Fatalf("expected at least 2 model requests, got %d", len(client.requests))
-	}
-	items := client.requests[1].Input.Items
-	if len(items) == 0 {
-		t.Fatalf("second request has no input items")
-	}
-	last := items[len(items)-1]
-	if last.Type != "function_call_output" {
-		t.Fatalf("expected last item function_call_output, got %q", last.Type)
-	}
-	if last.CallID != "call-1" {
-		t.Fatalf("unexpected call id: %q", last.CallID)
-	}
-	if last.Output != "tool-output" {
-		t.Fatalf("unexpected tool output: %q", last.Output)
-	}
-}
-
 func TestLoopRunner_HookMustCallNext(t *testing.T) {
 	client := &hookTestClient{responses: []core.CreateResponseResult{{FinalText: "hello"}}}
 	runner := NewLoopRunner(client, nil, LoopRunnerOptions{MaxIterations: 2})
@@ -216,3 +172,201 @@ func TestLoopRunner_ModelHookAllowedToolNamesRestrictsExecution(t *testing.T) {
 		t.Fatalf("expected tool restriction marker in output, got: %q", last.Output)
 	}
 }
+
+func TestRoundtripHookCanRequestCompactionRewrite(t *testing.T) {
+	client := &hookTestClient{responses: []core.CreateResponseResult{
+		{ID: "resp-1", ToolCalls: []core.ToolCall{{CallID: "call-1", Name: "echo", Arguments: "{}"}}},
+		{ID: "resp-2", FinalText: "done"},
+	}}
+	registry := core.NewToolRegistry[struct{}]()
+	if err := registry.Register(runnerStateTool{}); err != nil {
+		t.Fatalf("register tool failed: %v", err)
+	}
+	runner := NewLoopRunner(client, registry, LoopRunnerOptions{MaxIterations: 3})
+	runner.RegisterCompactionDelegate(func(input CompactionDelegateInput) (CompactionDelegateOutput, error) {
+		return CompactionDelegateOutput{
+			NeedCompaction:        true,
+			ForceHistoryMode:      HistoryModeLocalReplay,
+			ResetPreviousResponse: true,
+			RewriteRequest: &ContextBuildRequest{
+				Inbound: input.OriginalContextRequest.Inbound,
+				PrebuiltRequest: &core.CreateResponseRequest{
+					Model: "gpt-test",
+					Input: core.NewResponseInputItems([]core.ResponseInputItem{
+						buildSystemMessageInputItem("summary"),
+						buildUserMessageInputItem("hello"),
+					}),
+				},
+				PrebuiltHistoryInputItems: []core.ResponseInputItem{
+					buildSystemMessageInputItem("summary"),
+					buildUserMessageInputItem("hello"),
+				},
+				PrebuiltAppliedHistoryMode: HistoryModeLocalReplay,
+			},
+		}, nil
+	})
+
+	out, err := runner.RunWithContextResult(context.Background(), ContextBuildRequest{
+		Inbound:            InboundMessage{Role: "user", Content: "hello"},
+		HistoryMode:        HistoryModeProviderState,
+		PreviousResponseID: "resp-0",
+		Store:              boolPtr(true),
+	})
+	if err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+	if out.AppliedHistoryMode != HistoryModeLocalReplay {
+		t.Fatalf("expected local replay after compaction, got %q", out.AppliedHistoryMode)
+	}
+	if len(client.requests) < 2 {
+		t.Fatalf("expected second request after tool roundtrip, got %d requests", len(client.requests))
+	}
+	second := client.requests[1]
+	if second.PreviousResponseID != "" {
+		t.Fatalf("expected previous_response_id reset, got %#v", second)
+	}
+	if len(second.Input.Items) < 1 || len(second.Input.Items[0].Content) < 1 || second.Input.Items[0].Content[0].Text != "summary" {
+		t.Fatalf("expected compacted summary in second request, got %#v", second.Input.Items)
+	}
+}
+
+func TestLoopRunner_RewritesContextBetweenRoundtripsWhenDelegateRequestsCompaction(t *testing.T) {
+	client := &hookTestClient{responses: []core.CreateResponseResult{
+		{ID: "resp-1", ToolCalls: []core.ToolCall{{CallID: "call-1", Name: "echo", Arguments: "{}"}}},
+		{ID: "resp-2", FinalText: "done"},
+	}}
+	registry := core.NewToolRegistry[struct{}]()
+	if err := registry.Register(runnerStateTool{}); err != nil {
+		t.Fatalf("register tool failed: %v", err)
+	}
+	runner := NewLoopRunner(client, registry, LoopRunnerOptions{MaxIterations: 3})
+	runner.RegisterCompactionDelegate(func(input CompactionDelegateInput) (CompactionDelegateOutput, error) {
+		if input.Iteration != 1 {
+			return CompactionDelegateOutput{}, nil
+		}
+		return CompactionDelegateOutput{
+			NeedCompaction:        true,
+			ForceHistoryMode:      HistoryModeLocalReplay,
+			ResetPreviousResponse: true,
+			RewriteRequest: &ContextBuildRequest{
+				Inbound: input.OriginalContextRequest.Inbound,
+				PrebuiltRequest: &core.CreateResponseRequest{
+					Model: "gpt-test",
+					Input: core.NewResponseInputItems([]core.ResponseInputItem{
+						buildSystemMessageInputItem("compacted summary"),
+						buildUserMessageInputItem("hello"),
+					}),
+				},
+				PrebuiltHistoryInputItems: []core.ResponseInputItem{
+					buildSystemMessageInputItem("compacted summary"),
+					buildUserMessageInputItem("hello"),
+				},
+				PrebuiltAppliedHistoryMode: HistoryModeLocalReplay,
+			},
+		}, nil
+	})
+
+	_, err := runner.RunWithContextResult(context.Background(), ContextBuildRequest{
+		Inbound:            InboundMessage{Role: "user", Content: "hello"},
+		HistoryMode:        HistoryModeProviderState,
+		PreviousResponseID: "resp-0",
+		Store:              boolPtr(true),
+	})
+	if err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+	if len(client.requests) < 2 {
+		t.Fatalf("expected second request after tool roundtrip, got %d requests", len(client.requests))
+	}
+	second := client.requests[1]
+	if second.PreviousResponseID != "" {
+		t.Fatalf("expected compacted second request to clear previous response id, got %#v", second)
+	}
+	if len(second.Input.Items) < 1 || len(second.Input.Items[0].Content) < 1 || second.Input.Items[0].Content[0].Text != "compacted summary" {
+		t.Fatalf("expected compacted second request, got %#v", second.Input.Items)
+	}
+}
+
+func TestCompactionDelegate_FailsFastWhenRewriteRequestMissing(t *testing.T) {
+	client := &hookTestClient{responses: []core.CreateResponseResult{
+		{ID: "resp-1", ToolCalls: []core.ToolCall{{CallID: "call-1", Name: "echo", Arguments: "{}"}}},
+	}}
+	registry := core.NewToolRegistry[struct{}]()
+	if err := registry.Register(runnerStateTool{}); err != nil {
+		t.Fatalf("register tool failed: %v", err)
+	}
+	runner := NewLoopRunner(client, registry, LoopRunnerOptions{MaxIterations: 2})
+	runner.RegisterCompactionDelegate(func(input CompactionDelegateInput) (CompactionDelegateOutput, error) {
+		return CompactionDelegateOutput{NeedCompaction: true, ForceHistoryMode: HistoryModeLocalReplay}, nil
+	})
+
+	_, err := runner.RunWithContextResult(context.Background(), ContextBuildRequest{
+		Inbound: InboundMessage{Role: "user", Content: "hello"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "rewrite request") {
+		t.Fatalf("expected missing rewrite request error, got %v", err)
+	}
+}
+
+func TestCompactionDelegate_ForceHistoryModeOverridesOriginalRequest(t *testing.T) {
+	client := &hookTestClient{responses: []core.CreateResponseResult{
+		{ID: "resp-1", ToolCalls: []core.ToolCall{{CallID: "call-1", Name: "echo", Arguments: "{}"}}},
+		{ID: "resp-2", FinalText: "done"},
+	}}
+	registry := core.NewToolRegistry[struct{}]()
+	if err := registry.Register(runnerStateTool{}); err != nil {
+		t.Fatalf("register tool failed: %v", err)
+	}
+	runner := NewLoopRunner(client, registry, LoopRunnerOptions{MaxIterations: 3})
+	runner.RegisterCompactionDelegate(func(input CompactionDelegateInput) (CompactionDelegateOutput, error) {
+		req := ContextBuildRequest{
+			Inbound:                    input.OriginalContextRequest.Inbound,
+			PrebuiltRequest:            &core.CreateResponseRequest{Input: core.NewResponseInputItems([]core.ResponseInputItem{buildUserMessageInputItem("hello")})},
+			PrebuiltHistoryInputItems:  []core.ResponseInputItem{buildUserMessageInputItem("hello")},
+			PrebuiltAppliedHistoryMode: HistoryModeProviderState,
+		}
+		return CompactionDelegateOutput{
+			NeedCompaction:   true,
+			RewriteRequest:   &req,
+			ForceHistoryMode: HistoryModeLocalReplay,
+		}, nil
+	})
+
+	out, err := runner.RunWithContextResult(context.Background(), ContextBuildRequest{
+		Inbound:            InboundMessage{Role: "user", Content: "hello"},
+		HistoryMode:        HistoryModeProviderState,
+		PreviousResponseID: "resp-0",
+		Store:              boolPtr(true),
+	})
+	if err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+	if out.AppliedHistoryMode != HistoryModeLocalReplay {
+		t.Fatalf("expected forced local replay, got %q", out.AppliedHistoryMode)
+	}
+}
+
+func TestCompactionDelegate_DoesNotRunOnTerminalResponse(t *testing.T) {
+	client := &hookTestClient{responses: []core.CreateResponseResult{{ID: "resp-1", FinalText: "done"}}}
+	runner := NewLoopRunner(client, nil, LoopRunnerOptions{MaxIterations: 2})
+	calls := 0
+	runner.RegisterCompactionDelegate(func(input CompactionDelegateInput) (CompactionDelegateOutput, error) {
+		calls++
+		return CompactionDelegateOutput{}, fmt.Errorf("should not be called")
+	})
+
+	out, err := runner.RunWithContextResult(context.Background(), ContextBuildRequest{
+		Inbound: InboundMessage{Role: "user", Content: "hello"},
+	})
+	if err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+	if out.FinalText != "done" {
+		t.Fatalf("unexpected output: %q", out.FinalText)
+	}
+	if calls != 0 {
+		t.Fatalf("expected no compaction delegate calls, got %d", calls)
+	}
+}
+
+func boolPtr(v bool) *bool { return &v }

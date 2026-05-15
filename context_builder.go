@@ -18,19 +18,22 @@ type SystemEvent struct {
 }
 
 type ContextBuildRequest struct {
-	Inbound             InboundMessage
-	SystemContextJSON   string
-	EventContextJSON    string
-	ConversationHistory string
-	HistoryMode         HistoryMode
-	PreviousResponseID  string
-	Store               *bool
-	SystemEvents        []SystemEvent
-	ThreadContext       string
-	IsFirstTurn         bool
-	GroupActivated      bool
-	SessionID           string
-	ActorID             string
+	Inbound                    InboundMessage
+	SystemContextJSON          string
+	EventContextJSON           string
+	ConversationHistory        string
+	HistoryMode                HistoryMode
+	PreviousResponseID         string
+	Store                      *bool
+	SystemEvents               []SystemEvent
+	ThreadContext              string
+	IsFirstTurn                bool
+	GroupActivated             bool
+	SessionID                  string
+	ActorID                    string
+	PrebuiltRequest            *core.CreateResponseRequest
+	PrebuiltHistoryInputItems  []core.ResponseInputItem
+	PrebuiltAppliedHistoryMode HistoryMode
 }
 
 type ContextBuildResult struct {
@@ -46,6 +49,19 @@ type ContextBuilder interface {
 type DefaultContextBuilder struct{}
 
 func (b DefaultContextBuilder) Build(req ContextBuildRequest) (ContextBuildResult, error) {
+	if req.PrebuiltRequest != nil {
+		appliedMode := normalizeHistoryMode(req.PrebuiltAppliedHistoryMode)
+		if appliedMode == "" {
+			appliedMode = HistoryModeLocalReplay
+		}
+		built := *req.PrebuiltRequest
+		built.Input = core.NewResponseInputItems(cloneResponseInputItems(built.Input.Items))
+		return ContextBuildResult{
+			Request:            built,
+			HistoryInputItems:  cloneResponseInputItems(req.PrebuiltHistoryInputItems),
+			AppliedHistoryMode: appliedMode,
+		}, nil
+	}
 	role := strings.TrimSpace(req.Inbound.Role)
 	if role == "" {
 		role = "user"

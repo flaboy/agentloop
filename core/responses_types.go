@@ -24,8 +24,9 @@ func NewResponseInputItems(items []ResponseInputItem) ResponseInput {
 }
 
 type ResponseInputContentPart struct {
-	Type string `json:"type"`
-	Text string `json:"text,omitempty"`
+	Type     string `json:"type"`
+	Text     string `json:"text,omitempty"`
+	ImageURL string `json:"image_url,omitempty"`
 }
 
 type ResponseInputItem struct {
