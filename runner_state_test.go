@@ -174,6 +174,45 @@ func TestLoopRunner_ProviderStateRoundtripUsesPreviousResponseIDInsteadOfReplayH
 	}
 }
 
+func TestLoopRunner_ProviderStateFirstTurnUsesResponseIDForToolRoundtrip(t *testing.T) {
+	client := &hookTestClient{responses: []core.CreateResponseResult{
+		{ID: "resp-1", ToolCalls: []core.ToolCall{{CallID: "call-1", Name: "echo", Arguments: "{}"}}},
+		{ID: "resp-2", FinalText: "done"},
+	}}
+	registry := core.NewToolRegistry[struct{}]()
+	if err := registry.Register(runnerStateTool{}); err != nil {
+		t.Fatalf("register tool failed: %v", err)
+	}
+	runner := NewLoopRunner(client, registry, LoopRunnerOptions{MaxIterations: 3})
+
+	out, err := runner.RunWithContextResult(context.Background(), ContextBuildRequest{
+		Inbound:     InboundMessage{Role: "user", Content: "hello"},
+		HistoryMode: HistoryModeProviderState,
+	})
+	if err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+	if out.AppliedHistoryMode != HistoryModeProviderState {
+		t.Fatalf("expected provider_state, got %q", out.AppliedHistoryMode)
+	}
+	if out.FinalResponseID != "resp-2" {
+		t.Fatalf("expected final response id resp-2, got %#v", out)
+	}
+	if len(client.requests) != 2 {
+		t.Fatalf("expected two model requests, got %d", len(client.requests))
+	}
+	if client.requests[0].PreviousResponseID != "" {
+		t.Fatalf("first request should not have previous_response_id, got %#v", client.requests[0])
+	}
+	second := client.requests[1]
+	if second.PreviousResponseID != "resp-1" {
+		t.Fatalf("expected second request to use resp-1, got %#v", second)
+	}
+	if len(second.Input.Items) != 1 || second.Input.Items[0].Type != "function_call_output" {
+		t.Fatalf("provider_state roundtrip must only send current tool output, got %#v", second.Input.Items)
+	}
+}
+
 func TestLoopRunner_MixedFinalTextAndToolCallsExecutesTools(t *testing.T) {
 	client := &hookTestClient{responses: []core.CreateResponseResult{
 		{

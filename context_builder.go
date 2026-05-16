@@ -106,8 +106,5 @@ func resolveHistoryMode(req ContextBuildRequest) HistoryMode {
 		}
 		return HistoryModeLocalReplay
 	}
-	if mode == HistoryModeProviderState && strings.TrimSpace(req.PreviousResponseID) == "" {
-		return HistoryModeLocalReplay
-	}
 	return mode
 }

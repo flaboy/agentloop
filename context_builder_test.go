@@ -93,3 +93,24 @@ func TestDefaultContextBuilder_HybridAutoUsesProviderStateWhenPreviousResponseID
 		t.Fatalf("expected system + current user only, got %d items", len(result.HistoryInputItems))
 	}
 }
+
+func TestDefaultContextBuilder_ProviderStateAllowsEmptyInitialPreviousResponseID(t *testing.T) {
+	store := true
+	result, err := DefaultContextBuilder{}.Build(ContextBuildRequest{
+		Inbound:     InboundMessage{Role: "user", Content: "hello"},
+		HistoryMode: HistoryModeProviderState,
+		Store:       &store,
+	})
+	if err != nil {
+		t.Fatalf("build failed: %v", err)
+	}
+	if result.AppliedHistoryMode != HistoryModeProviderState {
+		t.Fatalf("expected provider_state, got %q", result.AppliedHistoryMode)
+	}
+	if result.Request.PreviousResponseID != "" {
+		t.Fatalf("first provider_state request should not invent previous_response_id, got %q", result.Request.PreviousResponseID)
+	}
+	if len(result.Request.Input.Items) != 1 {
+		t.Fatalf("expected inbound input only, got %#v", result.Request.Input.Items)
+	}
+}
