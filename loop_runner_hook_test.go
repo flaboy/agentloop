@@ -27,6 +27,7 @@ func (c *hookTestClient) CreateResponse(_ context.Context, req core.CreateRespon
 
 type hookTestTool struct{}
 type hookTestOtherTool struct{}
+type hookTestLargeOutputTool struct{}
 
 func (hookTestTool) Name() string { return "echo" }
 
@@ -53,6 +54,20 @@ func (hookTestOtherTool) Execute(_ context.Context, _ struct{}, _ string, _ stri
 }
 
 func (hookTestOtherTool) Cancel(_ context.Context, _ struct{}, _ string, _ string) *core.ToolError {
+	return nil
+}
+
+func (hookTestLargeOutputTool) Name() string { return "large" }
+
+func (hookTestLargeOutputTool) Spec() core.ResponseToolSpec {
+	return core.ResponseToolSpec{Type: "function", Name: "large"}
+}
+
+func (hookTestLargeOutputTool) Execute(_ context.Context, _ struct{}, _ string, _ string) (string, *core.ToolError) {
+	return strings.Repeat("x", 400), nil
+}
+
+func (hookTestLargeOutputTool) Cancel(_ context.Context, _ struct{}, _ string, _ string) *core.ToolError {
 	return nil
 }
 
@@ -235,6 +250,41 @@ func TestRoundtripHookCanRequestCompactionRewrite(t *testing.T) {
 	}
 	if len(second.Input.Items) < 1 || len(second.Input.Items[0].Content) < 1 || second.Input.Items[0].Content[0].Text != "summary" {
 		t.Fatalf("expected compacted summary in second request, got %#v", second.Input.Items)
+	}
+}
+
+func TestCompactionDelegateReceivesPostToolOutputTokenLength(t *testing.T) {
+	client := &hookTestClient{responses: []core.CreateResponseResult{
+		{ID: "resp-1", ToolCalls: []core.ToolCall{{CallID: "call-1", Name: "large", Arguments: "{}"}}},
+		{ID: "resp-2", FinalText: "done"},
+	}}
+	registry := core.NewToolRegistry[struct{}]()
+	if err := registry.Register(hookTestLargeOutputTool{}); err != nil {
+		t.Fatalf("register tool failed: %v", err)
+	}
+	runner := NewLoopRunner(client, registry, LoopRunnerOptions{MaxIterations: 3})
+	var gotTokens int64
+	var gotTrigger CompactionTrigger
+	runner.RegisterCompactionDelegate(func(input CompactionDelegateInput) (CompactionDelegateOutput, error) {
+		gotTokens = input.ContextTokens
+		gotTrigger = input.Trigger
+		return CompactionDelegateOutput{}, nil
+	})
+
+	out, err := runner.RunWithContextResult(context.Background(), ContextBuildRequest{
+		Inbound: InboundMessage{Role: "user", Content: "run tool"},
+	})
+	if err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+	if out.FinalText != "done" {
+		t.Fatalf("unexpected output: %q", out.FinalText)
+	}
+	if gotTrigger != CompactionTriggerThreshold {
+		t.Fatalf("expected threshold trigger, got %q", gotTrigger)
+	}
+	if gotTokens < 100 {
+		t.Fatalf("expected tool output to be counted, got %d", gotTokens)
 	}
 }
 

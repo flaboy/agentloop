@@ -735,6 +735,8 @@ func (r *LoopRunner) runWithContextRequest(
 					ReplayItems:            cloneResponseInputItems(replayItems),
 					AppliedHistoryMode:     appliedHistoryMode,
 					PreviousResponseID:     strings.TrimSpace(res.ID),
+					Trigger:                CompactionTriggerThreshold,
+					ContextTokens:          r.estimateRequestTokenLength(req),
 				})
 				if compactionErr != nil {
 					return fmt.Errorf("compaction delegate failed iteration=%d: %w", iteration, compactionErr)
