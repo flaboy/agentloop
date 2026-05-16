@@ -384,9 +384,14 @@ func TestRunWithContext_CompactsAndRetriesOnContextOverflow(t *testing.T) {
 		responses: []core.CreateResponseResult{{ID: "resp-after-compaction", FinalText: "done"}},
 	}
 	runner := NewLoopRunner(client, nil, LoopRunnerOptions{MaxIterations: 3})
-	compactionCalls := 0
+	overflowCompactionCalls := 0
+	thresholdCompactionCalls := 0
 	runner.RegisterCompactionDelegate(func(input CompactionDelegateInput) (CompactionDelegateOutput, error) {
-		compactionCalls++
+		if input.Trigger == CompactionTriggerThreshold {
+			thresholdCompactionCalls++
+			return CompactionDelegateOutput{}, nil
+		}
+		overflowCompactionCalls++
 		if input.Trigger != CompactionTriggerContextOverflow {
 			t.Fatalf("expected context overflow trigger, got %q", input.Trigger)
 		}
@@ -433,8 +438,11 @@ func TestRunWithContext_CompactsAndRetriesOnContextOverflow(t *testing.T) {
 	if out.FinalText != "done" {
 		t.Fatalf("unexpected output: %q", out.FinalText)
 	}
-	if compactionCalls != 1 {
-		t.Fatalf("expected one compaction call, got %d", compactionCalls)
+	if overflowCompactionCalls != 1 {
+		t.Fatalf("expected one overflow compaction call, got %d", overflowCompactionCalls)
+	}
+	if thresholdCompactionCalls != 1 {
+		t.Fatalf("expected one final threshold compaction call, got %d", thresholdCompactionCalls)
 	}
 	if len(client.requests) != 2 {
 		t.Fatalf("expected original request and retry request, got %d", len(client.requests))
@@ -526,13 +534,22 @@ func TestCompactionDelegate_ForceHistoryModeOverridesOriginalRequest(t *testing.
 	}
 }
 
-func TestCompactionDelegate_DoesNotRunOnTerminalResponse(t *testing.T) {
+func TestCompactionDelegate_RunsOnTerminalResponse(t *testing.T) {
 	client := &hookTestClient{responses: []core.CreateResponseResult{{ID: "resp-1", FinalText: "done"}}}
 	runner := NewLoopRunner(client, nil, LoopRunnerOptions{MaxIterations: 2})
 	calls := 0
 	runner.RegisterCompactionDelegate(func(input CompactionDelegateInput) (CompactionDelegateOutput, error) {
 		calls++
-		return CompactionDelegateOutput{}, fmt.Errorf("should not be called")
+		if input.Trigger != CompactionTriggerThreshold {
+			t.Fatalf("expected threshold trigger, got %q", input.Trigger)
+		}
+		if input.ContextTokens <= 0 {
+			t.Fatalf("expected final request token estimate, got %d", input.ContextTokens)
+		}
+		if input.Response.ID != "resp-1" {
+			t.Fatalf("expected response in compaction input, got %#v", input.Response)
+		}
+		return CompactionDelegateOutput{}, nil
 	})
 
 	out, err := runner.RunWithContextResult(context.Background(), ContextBuildRequest{
@@ -544,8 +561,8 @@ func TestCompactionDelegate_DoesNotRunOnTerminalResponse(t *testing.T) {
 	if out.FinalText != "done" {
 		t.Fatalf("unexpected output: %q", out.FinalText)
 	}
-	if calls != 0 {
-		t.Fatalf("expected no compaction delegate calls, got %d", calls)
+	if calls != 1 {
+		t.Fatalf("expected one compaction delegate call, got %d", calls)
 	}
 }
 

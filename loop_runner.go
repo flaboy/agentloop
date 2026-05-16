@@ -331,11 +331,15 @@ func (r *LoopRunner) runWithContextRequest(
 			return err
 		})
 		res = modelHookCtx.Response
+		modelRequest := callReq
+		if modelHookCtx.Request != nil {
+			modelRequest = *modelHookCtx.Request
+		}
 		allowedTools, allowlistConfigured := modelHookCtx.AllowedToolNameSet()
 		if err != nil {
 			if IsLikelyContextOverflowError(err) && r.compaction != nil && overflowCompactionAttempts < maxOverflowCompactionAttempts {
 				overflowCompactionAttempts++
-				rewritten, compacted, compactErr := r.compactAfterContextOverflow(iteration, contextReq, callReq, appliedHistoryMode, err, overflowCompactionAttempts)
+				rewritten, compacted, compactErr := r.compactAfterContextOverflow(iteration, contextReq, modelRequest, appliedHistoryMode, err, overflowCompactionAttempts)
 				if compactErr != nil {
 					transition(RunnerEventRunFailed, RunnerStateFailed, iteration, RunnerSnapshot{
 						RequestSummary: reqSummary,
@@ -445,8 +449,60 @@ func (r *LoopRunner) runWithContextRequest(
 				})
 				continue
 			}
+			finalContextRewritten := false
+			if r.compaction != nil {
+				out, compactionErr := r.compaction(CompactionDelegateInput{
+					Iteration:              iteration,
+					OriginalContextRequest: contextReq,
+					CurrentRequest:         modelRequest,
+					Response:               *res,
+					AppliedHistoryMode:     appliedHistoryMode,
+					PreviousResponseID:     strings.TrimSpace(res.ID),
+					Trigger:                CompactionTriggerThreshold,
+					ContextTokens:          r.estimateRequestTokenLength(modelRequest),
+				})
+				if compactionErr != nil {
+					transition(RunnerEventRunFailed, RunnerStateFailed, iteration, RunnerSnapshot{
+						RequestSummary: reqSummary,
+						ResponseID:     strings.TrimSpace(res.ID),
+						LastError:      compactionErr.Error(),
+					})
+					return RunResult{}, fmt.Errorf("compaction delegate failed after final response iteration=%d: %w", iteration, compactionErr)
+				}
+				if out.NeedCompaction {
+					rewritten, rewriteErr := r.buildCompactionRewrite(iteration, out)
+					if rewriteErr != nil {
+						transition(RunnerEventRunFailed, RunnerStateFailed, iteration, RunnerSnapshot{
+							RequestSummary: reqSummary,
+							ResponseID:     strings.TrimSpace(res.ID),
+							LastError:      rewriteErr.Error(),
+						})
+						return RunResult{}, rewriteErr
+					}
+					req = rewritten.Request
+					historyInputItems = cloneResponseInputItems(rewritten.HistoryInputItems)
+					appliedHistoryMode = rewritten.AppliedHistoryMode
+					transition(RunnerEventRoundtripPrepared, RunnerStatePreparingRoundtrip, iteration, RunnerSnapshot{
+						RequestSummary: reqSummary,
+						ResponseID:     strings.TrimSpace(res.ID),
+						ToolCalls:      len(res.ToolCalls),
+						RoundtripMode:  roundtripModeName(appliedHistoryMode != HistoryModeProviderState),
+					})
+					transition(RunnerEventContextRewritten, RunnerStateCallingModel, iteration, RunnerSnapshot{
+						RequestSummary: summarizeCreateResponseRequest(req),
+						ResponseID:     strings.TrimSpace(res.ID),
+						ToolCalls:      len(res.ToolCalls),
+						RoundtripMode:  roundtripModeName(appliedHistoryMode != HistoryModeProviderState),
+					})
+					finalContextRewritten = true
+				}
+			}
+			completionReqSummary := reqSummary
+			if finalContextRewritten {
+				completionReqSummary = summarizeCreateResponseRequest(req)
+			}
 			transition(RunnerEventRunCompleted, RunnerStateCompleted, iteration, RunnerSnapshot{
-				RequestSummary: reqSummary,
+				RequestSummary: completionReqSummary,
 				ResponseID:     strings.TrimSpace(res.ID),
 				ToolCalls:      len(res.ToolCalls),
 				RoundtripMode:  roundtripModeName(appliedHistoryMode != HistoryModeProviderState),
