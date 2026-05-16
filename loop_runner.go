@@ -21,8 +21,9 @@ type ResponsesStreamAPI interface {
 }
 
 type LoopRunnerOptions struct {
-	MaxIterations  int
-	ContextBuilder ContextBuilder
+	MaxIterations        int
+	ContextBuilder       ContextBuilder
+	TokenLengthEstimator TokenLengthEstimator
 }
 
 type LoopRunner struct {
