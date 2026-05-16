@@ -38,6 +38,10 @@ func (hookTestTool) Execute(_ context.Context, _ struct{}, _ string, _ string) (
 	return "tool-output", nil
 }
 
+func (hookTestTool) Cancel(_ context.Context, _ struct{}, _ string, _ string) *core.ToolError {
+	return nil
+}
+
 func (hookTestOtherTool) Name() string { return "other" }
 
 func (hookTestOtherTool) Spec() core.ResponseToolSpec {
@@ -46,6 +50,10 @@ func (hookTestOtherTool) Spec() core.ResponseToolSpec {
 
 func (hookTestOtherTool) Execute(_ context.Context, _ struct{}, _ string, _ string) (string, *core.ToolError) {
 	return "other-output", nil
+}
+
+func (hookTestOtherTool) Cancel(_ context.Context, _ struct{}, _ string, _ string) *core.ToolError {
+	return nil
 }
 
 func TestLoopRunner_ModelHookWrapsModelCall(t *testing.T) {

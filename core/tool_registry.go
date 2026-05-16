@@ -111,3 +111,11 @@ func (r *ToolRegistry[S]) Execute(ctx context.Context, state S, name string, inp
 	}
 	return out, nil
 }
+
+func (r *ToolRegistry[S]) Cancel(ctx context.Context, state S, name string, input string, callID string) *ToolError {
+	tool, ok := r.Get(name)
+	if !ok {
+		return NewToolError("TOOL_NOT_FOUND", "tool is not registered")
+	}
+	return tool.Cancel(ctx, state, input, callID)
+}

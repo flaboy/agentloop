@@ -24,6 +24,10 @@ func (t registryTestTool) Execute(_ context.Context, _ registryTestState, _ stri
 	return "ok", nil
 }
 
+func (t registryTestTool) Cancel(_ context.Context, _ registryTestState, _ string, _ string) *ToolError {
+	return nil
+}
+
 func TestToolRegistry_RegisterAndSpecsByNames(t *testing.T) {
 	r := NewToolRegistry[registryTestState]()
 	if err := r.Register(registryTestTool{name: "b"}); err != nil {

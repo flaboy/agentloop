@@ -20,6 +20,10 @@ func (toolPipelineEcho) Execute(_ context.Context, _ struct{}, input string, _ s
 	return input, nil
 }
 
+func (toolPipelineEcho) Cancel(_ context.Context, _ struct{}, _ string, _ string) *core.ToolError {
+	return nil
+}
+
 func TestToolPipeline_NormalizesErrorWithErrorAndSuggest(t *testing.T) {
 	pipeline := NewToolPipeline(nil)
 	_, toolErr := pipeline.Execute(context.Background(), ToolPipelineInput{

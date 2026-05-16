@@ -19,6 +19,10 @@ func (runnerStateTool) Execute(_ context.Context, _ struct{}, _ string, _ string
 	return `{"ok":true}`, nil
 }
 
+func (runnerStateTool) Cancel(_ context.Context, _ struct{}, _ string, _ string) *core.ToolError {
+	return nil
+}
+
 func TestLoopRunner_RecordsTransitions(t *testing.T) {
 	client := &hookTestClient{responses: []core.CreateResponseResult{{FinalText: "done"}}}
 	runner := NewLoopRunner(client, nil, LoopRunnerOptions{MaxIterations: 2})

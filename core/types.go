@@ -124,4 +124,5 @@ type Tool[S any] interface {
 	Name() string
 	Spec() ResponseToolSpec
 	Execute(ctx context.Context, state S, input string, callID string) (string, *ToolError)
+	Cancel(ctx context.Context, state S, input string, callID string) *ToolError
 }

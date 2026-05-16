@@ -41,3 +41,19 @@ func (p *ToolPipeline) Execute(ctx context.Context, in ToolPipelineInput) (strin
 	}
 	return out, nil
 }
+
+func (p *ToolPipeline) Cancel(ctx context.Context, in ToolPipelineInput) *ToolError {
+	if p == nil || p.registry == nil {
+		return NewToolError("TOOL_REGISTRY_UNAVAILABLE", "Ensure tool registry is initialized and injected into LoopRunner")
+	}
+	toolName := strings.TrimSpace(in.ToolCall.Name)
+	if in.AllowlistConfigured {
+		if _, ok := in.AllowedTools[toolName]; !ok {
+			return NewToolError(
+				"TOOL_NOT_ENABLED_IN_MODE",
+				fmt.Sprintf("Tool %q is not in current allowed_tools; switch mode or adjust allowlist, then retry", toolName),
+			)
+		}
+	}
+	return p.registry.Cancel(ctx, struct{}{}, in.ToolCall.Name, in.ToolCall.Arguments, in.ToolCall.CallID)
+}

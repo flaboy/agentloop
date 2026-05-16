@@ -197,7 +197,10 @@ func (r *LoopRunner) runWithContextRequest(
 	transitionRecords := make([]TransitionRecord, 0, 16)
 	state := RunnerStateIdle
 	guard := NewRunnerTransitionGuard()
+	var transitionMu sync.Mutex
 	transition := func(event RunnerEvent, to RunnerState, iteration int, snapshot RunnerSnapshot) {
+		transitionMu.Lock()
+		defer transitionMu.Unlock()
 		if err := guard.Validate(state, event, to); err != nil {
 			panic(err)
 		}
@@ -435,8 +438,6 @@ func (r *LoopRunner) runWithContextRequest(
 			)
 		}
 
-		outputs := make([]core.ResponseInputItem, 0, len(res.ToolCalls))
-		replayItems := make([]core.ResponseInputItem, 0, len(res.ToolCalls)*2)
 		for _, call := range res.ToolCalls {
 			callID := strings.TrimSpace(call.CallID)
 			if callID == "" {
@@ -454,7 +455,75 @@ func (r *LoopRunner) runWithContextRequest(
 					reqSummary,
 				)
 			}
+		}
 
+		type toolRunResult struct {
+			index         int
+			call          core.ToolCall
+			output        string
+			outputErrText string
+			outputIsError bool
+			hookErr       error
+		}
+		results := make([]toolRunResult, len(res.ToolCalls))
+		resultCh := make(chan toolRunResult, len(res.ToolCalls))
+		toolCtx, cancelToolCtx := context.WithCancel(ctx)
+		defer cancelToolCtx()
+		activeMu := sync.Mutex{}
+		active := map[int]core.ToolCall{}
+		pipeline := NewToolPipeline(r.tools)
+		cancelErrMu := sync.Mutex{}
+		var cancelErr *ToolError
+		cancelledMu := sync.Mutex{}
+		cancelledCalls := map[int]struct{}{}
+		cancelCall := func(idx int, call core.ToolCall) {
+			cancelledMu.Lock()
+			if _, ok := cancelledCalls[idx]; ok {
+				cancelledMu.Unlock()
+				return
+			}
+			cancelledCalls[idx] = struct{}{}
+			cancelledMu.Unlock()
+			cancelCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := pipeline.Cancel(cancelCtx, ToolPipelineInput{
+				AllowedTools:        allowedTools,
+				AllowlistConfigured: allowlistConfigured,
+				ToolCall:            call,
+			}); err != nil {
+				cancelErrMu.Lock()
+				if cancelErr == nil {
+					cancelErr = err
+				}
+				cancelErrMu.Unlock()
+			}
+		}
+		cancelActive := func() {
+			activeMu.Lock()
+			activeCalls := make(map[int]core.ToolCall, len(active))
+			for idx, call := range active {
+				activeCalls[idx] = call
+			}
+			activeMu.Unlock()
+			if len(activeCalls) == 0 {
+				return
+			}
+			for idx, call := range activeCalls {
+				cancelCall(idx, call)
+			}
+		}
+		cancelOnce := sync.Once{}
+		cancelDone := make(chan struct{})
+		go func() {
+			defer close(cancelDone)
+			<-toolCtx.Done()
+			cancelOnce.Do(cancelActive)
+		}()
+		var wg sync.WaitGroup
+		for idx, call := range res.ToolCalls {
+			idx := idx
+			call := call
+			callID := strings.TrimSpace(call.CallID)
 			r.emitLoopEvent(onToolEvent, ToolInputEvent{
 				Iteration:    iteration,
 				Timestamp:    time.Now(),
@@ -472,62 +541,119 @@ func (r *LoopRunner) runWithContextRequest(
 				RoundtripMode:  roundtripModeName(appliedHistoryMode != HistoryModeProviderState),
 			})
 
-			out := ""
-			outputErrText := ""
-			outputIsError := false
-			toolHookCtx := &HookContext{
-				Ctx:       ctx,
-				Iteration: iteration,
-				Response:  res,
-				ToolCall:  &call,
-			}
-			hookErr := r.runHookChain(HookPointToolCall, toolHookCtx, func() error {
-				out, outputErrText, outputIsError = r.executeToolCall(ctx, allowedTools, allowlistConfigured, call)
-				toolHookCtx.ToolOutput = &out
-				if outputIsError {
-					toolHookCtx.ToolErrorString = &outputErrText
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				activeMu.Lock()
+				active[idx] = call
+				activeMu.Unlock()
+				if toolCtx.Err() != nil {
+					cancelOnce.Do(cancelActive)
 				}
-				return nil
+				defer func() {
+					if toolCtx.Err() != nil {
+						cancelCall(idx, call)
+					}
+					activeMu.Lock()
+					delete(active, idx)
+					activeMu.Unlock()
+				}()
+				out := ""
+				outputErrText := ""
+				outputIsError := false
+				toolHookCtx := &HookContext{
+					Ctx:       toolCtx,
+					Iteration: iteration,
+					Response:  res,
+					ToolCall:  &call,
+				}
+				hookErr := r.runHookChain(HookPointToolCall, toolHookCtx, func() error {
+					out, outputErrText, outputIsError = r.executeToolCall(toolCtx, allowedTools, allowlistConfigured, call)
+					toolHookCtx.ToolOutput = &out
+					if outputIsError {
+						toolHookCtx.ToolErrorString = &outputErrText
+					}
+					return nil
+				})
+				if toolHookCtx.ToolOutput != nil {
+					out = *toolHookCtx.ToolOutput
+				}
+				if toolHookCtx.ToolErrorString != nil {
+					outputErrText = *toolHookCtx.ToolErrorString
+					outputIsError = strings.TrimSpace(outputErrText) != ""
+				}
+				outputState := "output-available"
+				if outputIsError {
+					outputState = "output-error"
+				}
+				r.emitLoopEvent(onToolEvent, ToolOutputEvent{
+					Iteration:   iteration,
+					Timestamp:   time.Now(),
+					CallID:      callID,
+					ResponseID:  strings.TrimSpace(res.ID),
+					ToolName:    strings.TrimSpace(call.Name),
+					State:       outputState,
+					ErrorString: outputErrText,
+					OutputLen:   len(strings.TrimSpace(out)),
+					Output:      normalizeJSONText(out),
+				})
+				transition(RunnerEventToolCallEnd, RunnerStateExecutingTools, iteration, RunnerSnapshot{
+					RequestSummary: reqSummary,
+					ResponseID:     strings.TrimSpace(res.ID),
+					ToolCalls:      len(res.ToolCalls),
+					RoundtripMode:  roundtripModeName(appliedHistoryMode != HistoryModeProviderState),
+				})
+				resultCh <- toolRunResult{
+					index:         idx,
+					call:          call,
+					output:        out,
+					outputErrText: outputErrText,
+					outputIsError: outputIsError,
+					hookErr:       hookErr,
+				}
+			}()
+		}
+		wg.Wait()
+		cancelToolCtx()
+		<-cancelDone
+		close(resultCh)
+		cancelErrMu.Lock()
+		capturedCancelErr := cancelErr
+		cancelErrMu.Unlock()
+		if capturedCancelErr != nil {
+			transition(RunnerEventRunFailed, RunnerStateFailed, iteration, RunnerSnapshot{
+				RequestSummary: reqSummary,
+				ResponseID:     strings.TrimSpace(res.ID),
+				LastError:      capturedCancelErr.Error(),
 			})
-			if hookErr != nil {
+			return RunResult{}, fmt.Errorf("tool cancellation failed iteration=%d response_id=%q: %w", iteration, strings.TrimSpace(res.ID), capturedCancelErr)
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			transition(RunnerEventRunFailed, RunnerStateFailed, iteration, RunnerSnapshot{
+				RequestSummary: reqSummary,
+				ResponseID:     strings.TrimSpace(res.ID),
+				LastError:      ctxErr.Error(),
+			})
+			return RunResult{}, fmt.Errorf("tool execution cancelled iteration=%d response_id=%q: %w", iteration, strings.TrimSpace(res.ID), ctxErr)
+		}
+		for result := range resultCh {
+			results[result.index] = result
+		}
+		outputs := make([]core.ResponseInputItem, 0, len(res.ToolCalls))
+		replayItems := make([]core.ResponseInputItem, 0, len(res.ToolCalls)*2)
+		for _, result := range results {
+			call := result.call
+			callID := strings.TrimSpace(call.CallID)
+			if result.hookErr != nil {
 				transition(RunnerEventRunFailed, RunnerStateFailed, iteration, RunnerSnapshot{
 					RequestSummary: reqSummary,
 					ResponseID:     strings.TrimSpace(res.ID),
-					LastError:      hookErr.Error(),
+					LastError:      result.hookErr.Error(),
 				})
-				return RunResult{}, fmt.Errorf("tool hook failed iteration=%d call_id=%q tool=%q: %w", iteration, callID, strings.TrimSpace(call.Name), hookErr)
+				return RunResult{}, fmt.Errorf("tool hook failed iteration=%d call_id=%q tool=%q: %w", iteration, callID, strings.TrimSpace(call.Name), result.hookErr)
 			}
-			if toolHookCtx.ToolOutput != nil {
-				out = *toolHookCtx.ToolOutput
-			}
-			if toolHookCtx.ToolErrorString != nil {
-				outputErrText = *toolHookCtx.ToolErrorString
-				outputIsError = strings.TrimSpace(outputErrText) != ""
-			}
-			outputState := "output-available"
-			if outputIsError {
-				outputState = "output-error"
-			}
-			r.emitLoopEvent(onToolEvent, ToolOutputEvent{
-				Iteration:   iteration,
-				Timestamp:   time.Now(),
-				CallID:      callID,
-				ResponseID:  strings.TrimSpace(res.ID),
-				ToolName:    strings.TrimSpace(call.Name),
-				State:       outputState,
-				ErrorString: outputErrText,
-				OutputLen:   len(strings.TrimSpace(out)),
-				Output:      normalizeJSONText(out),
-			})
-			transition(RunnerEventToolCallEnd, RunnerStateExecutingTools, iteration, RunnerSnapshot{
-				RequestSummary: reqSummary,
-				ResponseID:     strings.TrimSpace(res.ID),
-				ToolCalls:      len(res.ToolCalls),
-				RoundtripMode:  roundtripModeName(appliedHistoryMode != HistoryModeProviderState),
-			})
-
 			replayCall := buildReplayFunctionCallInputItem(call)
-			outputItem := core.ResponseInputItem{Type: "function_call_output", CallID: callID, Output: out}
+			outputItem := core.ResponseInputItem{Type: "function_call_output", CallID: callID, Output: result.output}
 			outputs = append(outputs, outputItem)
 			replayItems = append(replayItems, replayCall, outputItem)
 		}
