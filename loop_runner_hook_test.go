@@ -2,6 +2,7 @@ package agentloop
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"reflect"
 	"strings"
@@ -12,11 +13,19 @@ import (
 
 type hookTestClient struct {
 	responses []core.CreateResponseResult
+	errors    []error
 	requests  []core.CreateResponseRequest
 }
 
 func (c *hookTestClient) CreateResponse(_ context.Context, req core.CreateResponseRequest) (*core.CreateResponseResult, error) {
 	c.requests = append(c.requests, req)
+	if len(c.errors) > 0 {
+		err := c.errors[0]
+		c.errors = c.errors[1:]
+		if err != nil {
+			return nil, err
+		}
+	}
 	if len(c.responses) == 0 {
 		return &core.CreateResponseResult{FinalText: "done"}, nil
 	}
@@ -363,6 +372,119 @@ func TestCompactionDelegate_FailsFastWhenRewriteRequestMissing(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "rewrite request") {
 		t.Fatalf("expected missing rewrite request error, got %v", err)
+	}
+}
+
+func TestRunWithContext_CompactsAndRetriesOnContextOverflow(t *testing.T) {
+	client := &hookTestClient{
+		errors: []error{
+			errors.New("request_too_large: Request size exceeds model context window"),
+			nil,
+		},
+		responses: []core.CreateResponseResult{{ID: "resp-after-compaction", FinalText: "done"}},
+	}
+	runner := NewLoopRunner(client, nil, LoopRunnerOptions{MaxIterations: 3})
+	compactionCalls := 0
+	runner.RegisterCompactionDelegate(func(input CompactionDelegateInput) (CompactionDelegateOutput, error) {
+		compactionCalls++
+		if input.Trigger != CompactionTriggerContextOverflow {
+			t.Fatalf("expected context overflow trigger, got %q", input.Trigger)
+		}
+		if input.ContextOverflowRetryCount != 1 {
+			t.Fatalf("expected retry count 1, got %d", input.ContextOverflowRetryCount)
+		}
+		if !strings.Contains(input.ContextOverflowErrorText, "request_too_large") {
+			t.Fatalf("expected overflow error text, got %q", input.ContextOverflowErrorText)
+		}
+		if input.ContextTokens <= 0 {
+			t.Fatalf("expected current request token estimate, got %d", input.ContextTokens)
+		}
+		return CompactionDelegateOutput{
+			NeedCompaction:        true,
+			ForceHistoryMode:      HistoryModeLocalReplay,
+			ResetPreviousResponse: true,
+			RewriteRequest: &ContextBuildRequest{
+				Inbound: input.OriginalContextRequest.Inbound,
+				PrebuiltRequest: &core.CreateResponseRequest{
+					Input: core.NewResponseInputItems([]core.ResponseInputItem{
+						buildSystemMessageInputItem("summary"),
+						buildUserMessageInputItem("hello"),
+					}),
+					PreviousResponseID: "must-be-cleared",
+				},
+				PrebuiltHistoryInputItems: []core.ResponseInputItem{
+					buildSystemMessageInputItem("summary"),
+					buildUserMessageInputItem("hello"),
+				},
+				PrebuiltAppliedHistoryMode: HistoryModeLocalReplay,
+			},
+		}, nil
+	})
+
+	out, err := runner.RunWithContextResult(context.Background(), ContextBuildRequest{
+		Inbound:            InboundMessage{Role: "user", Content: "hello"},
+		HistoryMode:        HistoryModeProviderState,
+		PreviousResponseID: "resp-before",
+		Store:              boolPtr(true),
+	})
+	if err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+	if out.FinalText != "done" {
+		t.Fatalf("unexpected output: %q", out.FinalText)
+	}
+	if compactionCalls != 1 {
+		t.Fatalf("expected one compaction call, got %d", compactionCalls)
+	}
+	if len(client.requests) != 2 {
+		t.Fatalf("expected original request and retry request, got %d", len(client.requests))
+	}
+	if client.requests[1].PreviousResponseID != "" {
+		t.Fatalf("expected retry request to clear previous response id, got %#v", client.requests[1])
+	}
+}
+
+func TestRunWithContext_StopsAfterMaxContextOverflowCompactions(t *testing.T) {
+	overflowErr := errors.New("request_too_large: Request size exceeds model context window")
+	client := &hookTestClient{
+		errors: []error{overflowErr, overflowErr, overflowErr, overflowErr},
+	}
+	runner := NewLoopRunner(client, nil, LoopRunnerOptions{MaxIterations: 10})
+	compactionCalls := 0
+	runner.RegisterCompactionDelegate(func(input CompactionDelegateInput) (CompactionDelegateOutput, error) {
+		compactionCalls++
+		return CompactionDelegateOutput{
+			NeedCompaction:        true,
+			ForceHistoryMode:      HistoryModeLocalReplay,
+			ResetPreviousResponse: true,
+			RewriteRequest: &ContextBuildRequest{
+				Inbound: input.OriginalContextRequest.Inbound,
+				PrebuiltRequest: &core.CreateResponseRequest{
+					Input: core.NewResponseInputItems([]core.ResponseInputItem{
+						buildSystemMessageInputItem(fmt.Sprintf("summary %d", compactionCalls)),
+						buildUserMessageInputItem("hello"),
+					}),
+				},
+				PrebuiltHistoryInputItems: []core.ResponseInputItem{
+					buildSystemMessageInputItem(fmt.Sprintf("summary %d", compactionCalls)),
+					buildUserMessageInputItem("hello"),
+				},
+				PrebuiltAppliedHistoryMode: HistoryModeLocalReplay,
+			},
+		}, nil
+	})
+
+	_, err := runner.RunWithContextResult(context.Background(), ContextBuildRequest{
+		Inbound: InboundMessage{Role: "user", Content: "hello"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "request_too_large") {
+		t.Fatalf("expected final overflow error, got %v", err)
+	}
+	if compactionCalls != 3 {
+		t.Fatalf("expected 3 overflow compaction attempts, got %d", compactionCalls)
+	}
+	if len(client.requests) != 4 {
+		t.Fatalf("expected 4 model requests, got %d", len(client.requests))
 	}
 }
 

@@ -21,9 +21,10 @@ type ResponsesStreamAPI interface {
 }
 
 type LoopRunnerOptions struct {
-	MaxIterations        int
-	ContextBuilder       ContextBuilder
-	TokenLengthEstimator TokenLengthEstimator
+	MaxIterations                 int
+	ContextBuilder                ContextBuilder
+	TokenLengthEstimator          TokenLengthEstimator
+	MaxOverflowCompactionAttempts int
 }
 
 type LoopRunner struct {
@@ -238,6 +239,11 @@ func (r *LoopRunner) runWithContextRequest(
 	req := contextResult.Request
 	historyInputItems := cloneResponseInputItems(contextResult.HistoryInputItems)
 	lastResponseTrace := ""
+	maxOverflowCompactionAttempts := r.options.MaxOverflowCompactionAttempts
+	if maxOverflowCompactionAttempts <= 0 {
+		maxOverflowCompactionAttempts = 3
+	}
+	overflowCompactionAttempts := 0
 	unbounded := r.options.MaxIterations <= 0
 	for i := 0; unbounded || i < r.options.MaxIterations; i++ {
 		iteration := i + 1
@@ -327,6 +333,33 @@ func (r *LoopRunner) runWithContextRequest(
 		res = modelHookCtx.Response
 		allowedTools, allowlistConfigured := modelHookCtx.AllowedToolNameSet()
 		if err != nil {
+			if IsLikelyContextOverflowError(err) && r.compaction != nil && overflowCompactionAttempts < maxOverflowCompactionAttempts {
+				overflowCompactionAttempts++
+				rewritten, compacted, compactErr := r.compactAfterContextOverflow(iteration, contextReq, callReq, appliedHistoryMode, err, overflowCompactionAttempts)
+				if compactErr != nil {
+					transition(RunnerEventRunFailed, RunnerStateFailed, iteration, RunnerSnapshot{
+						RequestSummary: reqSummary,
+						LastError:      compactErr.Error(),
+					})
+					return RunResult{}, compactErr
+				}
+				if compacted {
+					req = rewritten.Request
+					historyInputItems = cloneResponseInputItems(rewritten.HistoryInputItems)
+					appliedHistoryMode = rewritten.AppliedHistoryMode
+					transition(RunnerEventRoundtripPrepared, RunnerStatePreparingRoundtrip, iteration, RunnerSnapshot{
+						RequestSummary: reqSummary,
+						LastError:      err.Error(),
+						RoundtripMode:  roundtripModeName(appliedHistoryMode != HistoryModeProviderState),
+					})
+					transition(RunnerEventContextRewritten, RunnerStateCallingModel, iteration, RunnerSnapshot{
+						RequestSummary: summarizeCreateResponseRequest(req),
+						LastError:      err.Error(),
+						RoundtripMode:  roundtripModeName(appliedHistoryMode != HistoryModeProviderState),
+					})
+					continue
+				}
+			}
 			base := fmt.Sprintf("responses request failed iteration=%d %s", iteration, reqSummary)
 			if strings.TrimSpace(lastResponseTrace) != "" {
 				base += " prev_response_trace=" + lastResponseTrace
@@ -742,27 +775,9 @@ func (r *LoopRunner) runWithContextRequest(
 					return fmt.Errorf("compaction delegate failed iteration=%d: %w", iteration, compactionErr)
 				}
 				if out.NeedCompaction {
-					if out.RewriteRequest == nil {
-						return fmt.Errorf("compaction delegate missing rewrite request iteration=%d", iteration)
-					}
-					rewriteReq := *out.RewriteRequest
-					if out.ForceHistoryMode != "" {
-						rewriteReq.HistoryMode = out.ForceHistoryMode
-						if rewriteReq.PrebuiltRequest != nil {
-							rewriteReq.PrebuiltAppliedHistoryMode = out.ForceHistoryMode
-						}
-					}
-					if out.ResetPreviousResponse {
-						rewriteReq.PreviousResponseID = ""
-						if rewriteReq.PrebuiltRequest != nil {
-							rewrite := *rewriteReq.PrebuiltRequest
-							rewrite.PreviousResponseID = ""
-							rewriteReq.PrebuiltRequest = &rewrite
-						}
-					}
-					rewritten, rewriteErr := r.contextBuilder.Build(rewriteReq)
+					rewritten, rewriteErr := r.buildCompactionRewrite(iteration, out)
 					if rewriteErr != nil {
-						return fmt.Errorf("build compacted context failed iteration=%d: %w", iteration, rewriteErr)
+						return rewriteErr
 					}
 					req = rewritten.Request
 					historyInputItems = cloneResponseInputItems(rewritten.HistoryInputItems)
@@ -852,6 +867,63 @@ func (r *LoopRunner) runWithContextRequest(
 		LastError: "responses loop exceeded max iterations",
 	})
 	return RunResult{}, fmt.Errorf("responses loop exceeded max iterations: %d", r.options.MaxIterations)
+}
+
+func (r *LoopRunner) compactAfterContextOverflow(
+	iteration int,
+	originalContextReq ContextBuildRequest,
+	currentReq core.CreateResponseRequest,
+	appliedHistoryMode HistoryMode,
+	modelErr error,
+	retryCount int,
+) (ContextBuildResult, bool, error) {
+	out, compactionErr := r.compaction(CompactionDelegateInput{
+		Iteration:                 iteration,
+		OriginalContextRequest:    originalContextReq,
+		CurrentRequest:            currentReq,
+		AppliedHistoryMode:        appliedHistoryMode,
+		Trigger:                   CompactionTriggerContextOverflow,
+		ContextTokens:             r.estimateRequestTokenLength(currentReq),
+		ContextOverflowErrorText:  strings.TrimSpace(modelErr.Error()),
+		ContextOverflowRetryCount: retryCount,
+	})
+	if compactionErr != nil {
+		return ContextBuildResult{}, false, fmt.Errorf("compaction delegate failed after context overflow iteration=%d retry=%d: %w", iteration, retryCount, compactionErr)
+	}
+	if !out.NeedCompaction {
+		return ContextBuildResult{}, false, nil
+	}
+	rewritten, rewriteErr := r.buildCompactionRewrite(iteration, out)
+	if rewriteErr != nil {
+		return ContextBuildResult{}, false, rewriteErr
+	}
+	return rewritten, true, nil
+}
+
+func (r *LoopRunner) buildCompactionRewrite(iteration int, out CompactionDelegateOutput) (ContextBuildResult, error) {
+	if out.RewriteRequest == nil {
+		return ContextBuildResult{}, fmt.Errorf("compaction delegate missing rewrite request iteration=%d", iteration)
+	}
+	rewriteReq := *out.RewriteRequest
+	if out.ForceHistoryMode != "" {
+		rewriteReq.HistoryMode = out.ForceHistoryMode
+		if rewriteReq.PrebuiltRequest != nil {
+			rewriteReq.PrebuiltAppliedHistoryMode = out.ForceHistoryMode
+		}
+	}
+	if out.ResetPreviousResponse {
+		rewriteReq.PreviousResponseID = ""
+		if rewriteReq.PrebuiltRequest != nil {
+			rewrite := *rewriteReq.PrebuiltRequest
+			rewrite.PreviousResponseID = ""
+			rewriteReq.PrebuiltRequest = &rewrite
+		}
+	}
+	rewritten, rewriteErr := r.contextBuilder.Build(rewriteReq)
+	if rewriteErr != nil {
+		return ContextBuildResult{}, fmt.Errorf("build compacted context failed iteration=%d: %w", iteration, rewriteErr)
+	}
+	return rewritten, nil
 }
 
 func (r *LoopRunner) executeToolCall(
