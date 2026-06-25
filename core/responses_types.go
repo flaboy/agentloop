@@ -57,11 +57,22 @@ type ToolCall struct {
 	Arguments  string
 }
 
+type ResponseUsage struct {
+	InputTokens     int64  `json:"input_tokens,omitempty"`
+	OutputTokens    int64  `json:"output_tokens,omitempty"`
+	TotalTokens     int64  `json:"total_tokens,omitempty"`
+	ReasoningTokens int64  `json:"reasoning_tokens,omitempty"`
+	CachedTokens    int64  `json:"cached_tokens,omitempty"`
+	RawJSON         string `json:"raw_json,omitempty"`
+}
+
 type CreateResponseResult struct {
 	ID         string
 	FinalText  string
 	ToolCalls  []ToolCall
 	EventTrace []string
+	Usage      *ResponseUsage
+	RawJSON    string
 }
 
 func (r CreateResponseResult) HasFinalText() bool {

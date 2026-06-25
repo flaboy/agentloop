@@ -329,6 +329,10 @@ func (c *ResponsesClient) CreateResponseStream(ctx context.Context, req core.Cre
 			}
 			return fmt.Errorf("responses api failed response_id=%q code=%q message=%q", respID, code, message)
 		case "response.completed":
+			if rawResponse, err := json.Marshal(event.Response); err == nil {
+				out.RawJSON = string(rawResponse)
+				out.Usage = parseResponseUsage(rawResponse)
+			}
 			for _, item := range event.Response.Output {
 				if call, ok := toToolCall(item); ok {
 					if strings.TrimSpace(call.ResponseID) == "" {
@@ -534,7 +538,11 @@ func parseResponseResult(raw []byte) (*core.CreateResponseResult, error) {
 		}
 		return nil, fmt.Errorf("responses api failed response_id=%q code=%q message=%q", strings.TrimSpace(decoded.ID), code, message)
 	}
-	out := &core.CreateResponseResult{ID: strings.TrimSpace(decoded.ID)}
+	out := &core.CreateResponseResult{
+		ID:      strings.TrimSpace(decoded.ID),
+		Usage:   parseResponseUsage(raw),
+		RawJSON: string(raw),
+	}
 	for _, item := range decoded.Output {
 		if call, ok := toToolCall(item); ok {
 			if strings.TrimSpace(call.ResponseID) == "" {
@@ -546,6 +554,63 @@ func parseResponseResult(raw []byte) (*core.CreateResponseResult, error) {
 		appendMessageText(out, item.Content)
 	}
 	return out, nil
+}
+
+func parseResponseUsage(raw []byte) *core.ResponseUsage {
+	if len(raw) == 0 {
+		return nil
+	}
+	var envelope struct {
+		Usage json.RawMessage `json:"usage"`
+	}
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		return nil
+	}
+	usageRaw := envelope.Usage
+	if len(usageRaw) == 0 || string(usageRaw) == "null" {
+		usageRaw = raw
+	}
+	var usageMap map[string]any
+	if err := json.Unmarshal(usageRaw, &usageMap); err != nil {
+		return nil
+	}
+	if len(usageMap) == 0 {
+		return nil
+	}
+	usage := &core.ResponseUsage{
+		InputTokens:     responseUsageInt64(usageMap, "input_tokens"),
+		OutputTokens:    responseUsageInt64(usageMap, "output_tokens"),
+		TotalTokens:     responseUsageInt64(usageMap, "total_tokens"),
+		ReasoningTokens: responseUsageInt64(usageMap, "reasoning_tokens"),
+		CachedTokens:    responseUsageInt64(usageMap, "cached_tokens"),
+		RawJSON:         string(usageRaw),
+	}
+	if details, ok := usageMap["input_tokens_details"].(map[string]any); ok && usage.CachedTokens == 0 {
+		usage.CachedTokens = responseUsageInt64(details, "cached_tokens")
+	}
+	if details, ok := usageMap["output_tokens_details"].(map[string]any); ok && usage.ReasoningTokens == 0 {
+		usage.ReasoningTokens = responseUsageInt64(details, "reasoning_tokens")
+	}
+	if usage.InputTokens == 0 && usage.OutputTokens == 0 && usage.TotalTokens == 0 && usage.ReasoningTokens == 0 && usage.CachedTokens == 0 {
+		return nil
+	}
+	return usage
+}
+
+func responseUsageInt64(values map[string]any, key string) int64 {
+	switch v := values[key].(type) {
+	case float64:
+		return int64(v)
+	case int64:
+		return v
+	case int:
+		return int64(v)
+	case json.Number:
+		out, _ := v.Int64()
+		return out
+	default:
+		return 0
+	}
 }
 
 func (c *ResponsesClient) wrapRequestError(err error, req core.CreateResponseRequest, rawResp *http.Response) error {
@@ -591,6 +656,7 @@ type responsePayload struct {
 	Status string           `json:"status"`
 	Error  *responseFailure `json:"error"`
 	Output []responseItem   `json:"output"`
+	Usage  json.RawMessage  `json:"usage"`
 }
 
 type responseFailure struct {
